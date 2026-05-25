@@ -1093,6 +1093,46 @@ impl RysqlApp {
             .push_to_focused_leaf(DockTab::SqlEditor { buffer_id: id });
     }
 
+    /// Resolve the `tab_id` of the result set behind whatever the user
+    /// has focused: a `DockTab::Results` directly, or the Data subtab of
+    /// a `DockTab::Object`. Returns `None` for editor tabs or for object
+    /// tabs whose active subtab isn't Data / hasn't loaded yet.
+    fn focused_data_tab_id(&self) -> Option<u64> {
+        let node_path = self.dock.focused_leaf()?;
+        let leaf = self.dock.leaf(node_path).ok()?;
+        let tab = leaf.tabs.get(leaf.active.0)?;
+        match tab {
+            DockTab::Results { tab_id } => Some(*tab_id),
+            DockTab::Object { key } => {
+                let state = self.objects.get(key)?;
+                if state.sub == object_view::SubTab::Data {
+                    state.data_tab_id()
+                } else {
+                    None
+                }
+            }
+            DockTab::SqlEditor { .. } => None,
+        }
+    }
+
+    /// Ctrl+Del handler: route the focused tab's selection through the
+    /// same `open_delete_confirm` path the toolbar button uses. Empty
+    /// selection is a no-op (no point opening an empty confirm modal).
+    fn delete_focused_selection(&mut self) {
+        let Some(tab_id) = self.focused_data_tab_id() else {
+            return;
+        };
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let mut rows: Vec<usize> = self.results.tabs[idx].selection.iter().copied().collect();
+        rows.sort_unstable();
+        if rows.is_empty() {
+            return;
+        }
+        self.open_delete_confirm(tab_id, rows);
+    }
+
     /// Close the dock tab in the currently-focused leaf, regardless of
     /// variant. `on_close` on the viewer only fires when the user clicks the
     /// tab's close button — for shortcut-driven closes (`Ctrl+W`, menu) we
@@ -1977,6 +2017,17 @@ impl eframe::App for RysqlApp {
         self.apply_dock_actions(dock_actions);
         self.apply_results_actions(&ctx, dock_results_actions);
         self.apply_editor_actions(shortcut_actions);
+
+        // Ctrl+Del on the focused Results / Object-Data tab → bulk delete.
+        // Captured here so any open modal (which renders later in the
+        // frame) doesn't intercept the key.
+        if self.confirm.is_none() && self.dialog.is_none() {
+            let pressed =
+                ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Delete));
+            if pressed {
+                self.delete_focused_selection();
+            }
+        }
 
         self.render_dialog(&ctx);
         self.render_confirm(&ctx);
