@@ -240,7 +240,11 @@ impl RysqlApp {
                             self.fetch_primary_key(tab_id, target.db.clone(), target.table.clone());
                             tab.editable = Some(target);
                         }
-                        self.results.push(tab);
+                        let evicted = self.results.push(tab);
+                        if let Some(evicted_id) = evicted {
+                            self.remove_results_dock_tab(evicted_id);
+                        }
+                        self.dock.push_to_focused_leaf(DockTab::Results { tab_id });
                     }
                 }
                 UiEvent::PageAppended {
@@ -519,12 +523,6 @@ impl RysqlApp {
     fn apply_results_actions(&mut self, ctx: &egui::Context, actions: Vec<ResultsAction>) {
         for action in actions {
             match action {
-                ResultsAction::SelectTab(i) => {
-                    if i < self.results.tabs.len() {
-                        self.results.active = i;
-                    }
-                }
-                ResultsAction::CloseTab(i) => self.results.close(i),
                 ResultsAction::CopyText(text) => {
                     ctx.copy_text(text.clone());
                     self.last_info = Some(format!("Copied: {text}"));
@@ -535,8 +533,9 @@ impl RysqlApp {
                     offset,
                     limit,
                 } => self.fetch_more(tab_id, sql, offset, limit),
-                ResultsAction::Export { tab_idx, format } => {
-                    if let Some(tab) = self.results.tabs.get(tab_idx) {
+                ResultsAction::Export { tab_id, format } => {
+                    if let Some(idx) = self.results.find_by_id(tab_id) {
+                        let tab = &self.results.tabs[idx];
                         let payload = results::export(tab, format);
                         ctx.copy_text(payload);
                         let what = match format {
@@ -666,6 +665,9 @@ impl RysqlApp {
                 DockAction::CloseEditorBuffer(id) => {
                     self.editor.close_buffer_by_id(id);
                 }
+                DockAction::CloseResultsTab(id) => {
+                    self.results.remove_by_id(id);
+                }
                 DockAction::FocusedEditor(id) => {
                     if let Some(idx) = self.editor.buffer_index(id) {
                         self.editor.active = idx;
@@ -674,6 +676,17 @@ impl RysqlApp {
             }
         }
         self.ensure_at_least_one_editor_tab();
+    }
+
+    /// Remove the dock tab pointing at the given result `tab_id`, if any.
+    /// Used when `ResultsState::push` evicts an old tab past the cap.
+    fn remove_results_dock_tab(&mut self, tab_id: u64) {
+        let target = self.dock.iter_all_tabs().find_map(|(path, tab)| {
+            matches!(tab, DockTab::Results { tab_id: id } if *id == tab_id).then_some(path)
+        });
+        if let Some(path) = target {
+            self.dock.remove_tab(path);
+        }
     }
 
     /// UX safety net: never let the user end up looking at an empty dock.
@@ -1113,24 +1126,13 @@ impl eframe::App for RysqlApp {
         let shortcut_actions =
             editor::handle_shortcuts(&ctx, self.confirm.is_none() && self.dialog.is_none());
 
-        let mut results_actions = Vec::new();
-        if !self.results.is_empty() {
-            egui::Panel::bottom("results-pane")
-                .resizable(true)
-                .default_size(320.0)
-                .min_size(140.0)
-                .show_inside(ui, |ui| {
-                    results_actions = results::render(ui, &mut self.results);
-                });
-        }
-        self.apply_results_actions(&ctx, results_actions);
-
         let schema_names = self.collect_schema_names();
         let mut dock_actions: Vec<DockAction> = Vec::new();
+        let mut dock_results_actions: Vec<ResultsAction> = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::default().inner_margin(egui::Margin::same(0)))
             .show_inside(ui, |ui| {
-                let mut viewer = AppViewer::new(&mut self.editor, &schema_names);
+                let mut viewer = AppViewer::new(&mut self.editor, &mut self.results, &schema_names);
                 DockArea::new(&mut self.dock)
                     .style(Style::from_egui(ui.style().as_ref()))
                     .show_close_buttons(true)
@@ -1138,8 +1140,10 @@ impl eframe::App for RysqlApp {
                     .draggable_tabs(true)
                     .show_inside(ui, &mut viewer);
                 dock_actions = viewer.actions;
+                dock_results_actions = viewer.results_actions;
             });
         self.apply_dock_actions(dock_actions);
+        self.apply_results_actions(&ctx, dock_results_actions);
         self.apply_editor_actions(shortcut_actions);
 
         self.render_dialog(&ctx);

@@ -166,39 +166,39 @@ pub struct EditCellState {
 #[derive(Default)]
 pub struct ResultsState {
     pub tabs: Vec<ResultTab>,
-    pub active: usize,
     pub tab_seq: u64,
     pub blob_viewer: Option<BlobViewState>,
     pub edit_modal: Option<EditCellState>,
 }
 
-impl ResultsState {
-    pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
-    }
+/// Hard cap on the number of result tabs we keep around simultaneously. The
+/// oldest tabs are evicted past this — applies only to tabs *we know about*
+/// in `ResultsState`; the dock side mirrors the lifecycle via `on_close` so
+/// the caller is responsible for keeping it in sync.
+const MAX_RESULT_TABS: usize = 16;
 
+impl ResultsState {
     pub fn next_tab_id(&mut self) -> u64 {
         self.tab_seq += 1;
         self.tab_seq
     }
 
-    pub fn push(&mut self, tab: ResultTab) {
-        const MAX: usize = 16;
+    /// Push a freshly-built tab. Returns the id of an evicted tab, if any,
+    /// so the caller can remove the matching dock tab.
+    pub fn push(&mut self, tab: ResultTab) -> Option<u64> {
         self.tabs.push(tab);
-        if self.tabs.len() > MAX {
-            self.tabs.remove(0);
+        if self.tabs.len() > MAX_RESULT_TABS {
+            Some(self.tabs.remove(0).tab_id)
+        } else {
+            None
         }
-        self.active = self.tabs.len() - 1;
     }
 
-    pub fn close(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        self.tabs.remove(idx);
-        if self.active >= self.tabs.len() && self.active > 0 {
-            self.active = self.tabs.len().saturating_sub(1);
-        }
+    pub fn remove_by_id(&mut self, tab_id: u64) -> Option<ResultTab> {
+        self.tabs
+            .iter()
+            .position(|t| t.tab_id == tab_id)
+            .map(|i| self.tabs.remove(i))
     }
 
     pub fn find_by_id(&self, tab_id: u64) -> Option<usize> {
@@ -219,8 +219,6 @@ pub struct EditRequest {
 }
 
 pub enum ResultsAction {
-    SelectTab(usize),
-    CloseTab(usize),
     CopyText(String),
     FetchMore {
         tab_id: u64,
@@ -229,7 +227,7 @@ pub enum ResultsAction {
         limit: u64,
     },
     Export {
-        tab_idx: usize,
+        tab_id: u64,
         format: ExportFormat,
     },
     OpenEdit {
@@ -242,102 +240,64 @@ pub enum ResultsAction {
     ApplyEdit(EditRequest),
 }
 
-pub fn render(ui: &mut egui::Ui, state: &mut ResultsState) -> Vec<ResultsAction> {
-    let mut actions = Vec::new();
-    if state.tabs.is_empty() {
-        return actions;
-    }
+/// Render a single result tab's body (footer + grid). The dock owns the tab
+/// strip and the close button; this function only paints the contents of one
+/// leaf.
+pub fn render_one(
+    ui: &mut egui::Ui,
+    state: &mut ResultsState,
+    tab_id: u64,
+    actions: &mut Vec<ResultsAction>,
+) {
+    let Some(idx) = state.find_by_id(tab_id) else {
+        ui.label("Result tab closed");
+        return;
+    };
+    // Split borrow so the table renderer can mutate the blob viewer without
+    // re-borrowing `state`.
+    let tabs = &mut state.tabs;
+    let blob_viewer = &mut state.blob_viewer;
+    let tab = &mut tabs[idx];
 
-    let active_idx = state.active;
-    egui::Panel::top("results-tab-strip")
-        .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
-        .show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut to_close: Option<usize> = None;
-                let mut to_export: Option<(usize, ExportFormat)> = None;
-                for (idx, tab) in state.tabs.iter().enumerate() {
-                    let is_active = idx == active_idx;
-                    let suffix = if tab.has_more { "+" } else { "" };
-                    let label =
-                        format!("{}  ({}{} rows)", tab.label, tab.result.rows.len(), suffix);
-                    let resp = ui.selectable_label(is_active, label);
-                    if resp.clicked() && !is_active {
-                        actions.push(ResultsAction::SelectTab(idx));
-                    }
-                    resp.context_menu(|ui| {
-                        ui.label(egui::RichText::new("Export").weak().small());
-                        if ui.button("Copy as CSV").clicked() {
-                            to_export = Some((idx, ExportFormat::Csv));
-                            ui.close();
+    if tab.has_more {
+        egui::Panel::bottom(egui::Id::new(("results-footer", tab_id)))
+            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Showing {} rows · more available",
+                            tab.result.rows.len()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(format!("Fetch next {}", tab.page_size)).clicked() {
+                            actions.push(ResultsAction::FetchMore {
+                                tab_id: tab.tab_id,
+                                sql: tab.sql.clone(),
+                                offset: tab.next_offset,
+                                limit: tab.page_size,
+                            });
                         }
-                        if ui.button("Copy as TSV").clicked() {
-                            to_export = Some((idx, ExportFormat::Tsv));
-                            ui.close();
-                        }
-                        if ui.button("Copy as INSERT").clicked() {
-                            to_export = Some((idx, ExportFormat::Insert));
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Close").clicked() {
-                            to_close = Some(idx);
-                            ui.close();
-                        }
-                    });
-                    if ui.small_button("×").clicked() {
-                        to_close = Some(idx);
-                    }
-                    ui.separator();
-                }
-                if let Some(i) = to_close {
-                    actions.push(ResultsAction::CloseTab(i));
-                }
-                if let Some((i, fmt)) = to_export {
-                    actions.push(ResultsAction::Export {
-                        tab_idx: i,
-                        format: fmt,
-                    });
-                }
-            });
-        });
-
-    if let Some(tab) = state.tabs.get_mut(active_idx) {
-        if tab.has_more {
-            egui::Panel::bottom("results-footer")
-                .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
-                .show_inside(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Showing {} rows · more available",
-                                tab.result.rows.len()
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(format!("Fetch next {}", tab.page_size)).clicked() {
-                                actions.push(ResultsAction::FetchMore {
-                                    tab_id: tab.tab_id,
-                                    sql: tab.sql.clone(),
-                                    offset: tab.next_offset,
-                                    limit: tab.page_size,
-                                });
-                            }
-                        });
                     });
                 });
-        }
-        render_table(ui, tab, active_idx, &mut state.blob_viewer, &mut actions);
+            });
     }
+    render_table(ui, tab, blob_viewer, actions);
+}
 
-    actions
+/// Title shown by the dock for a result tab. Includes the row count and a
+/// trailing `+` when more pages are available.
+pub fn tab_title(tab: &ResultTab) -> String {
+    let suffix = if tab.has_more { "+" } else { "" };
+    format!("{}  ({}{} rows)", tab.label, tab.result.rows.len(), suffix)
 }
 
 fn render_table(
     ui: &mut egui::Ui,
     tab: &mut ResultTab,
-    tab_idx: usize,
     blob_viewer: &mut Option<BlobViewState>,
     actions: &mut Vec<ResultsAction>,
 ) {
@@ -445,7 +405,6 @@ fn render_table(
         tab.cycle_sort(i);
     }
 
-    let _ = tab_idx;
     if let Some((row, col)) = edit_request {
         if let Some(seed) = build_edit_request(tab, row, col) {
             actions.push(ResultsAction::OpenEdit {
