@@ -894,6 +894,14 @@ impl RysqlApp {
                     self.confirm_typed.clear();
                 }
                 ResultsAction::OpenInsert { tab_id } => self.open_insert_modal(tab_id),
+                ResultsAction::ApplyInlineEdit(req) => {
+                    // Spreadsheet-style edit: skip the confirm modal and
+                    // route straight to `run_edit`. The existing
+                    // `UiEvent::CellEdited` handler patches the cell on
+                    // success and surfaces server errors on the status
+                    // bar — same as the modal path.
+                    self.run_edit(req);
+                }
                 ResultsAction::OpenDeleteRow { tab_id, row } => {
                     self.open_delete_confirm(tab_id, vec![row]);
                 }

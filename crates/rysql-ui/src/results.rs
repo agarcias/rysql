@@ -55,6 +55,22 @@ pub struct ResultTab {
     /// ticked via the leading checkbox column. Stored as original indices
     /// so a sort change doesn't disturb the selection.
     pub selection: HashSet<usize>,
+    /// One-cell inline edit in progress (double-click → TextEdit). Only
+    /// one cell at a time; starting a new edit aborts the previous.
+    pub inline_edit: Option<InlineEditState>,
+}
+
+/// Cell-level editor backing the spreadsheet-style inline edit. `buffer`
+/// is the working text; `original` is captured on entry so we can detect
+/// no-op submits without going to the server. `needs_focus` requests
+/// keyboard focus + text selection on the first frame after creation.
+#[derive(Debug, Clone)]
+pub struct InlineEditState {
+    pub row: usize,
+    pub col: usize,
+    pub buffer: String,
+    pub original: String,
+    pub needs_focus: bool,
 }
 
 impl ResultTab {
@@ -69,6 +85,7 @@ impl ResultTab {
             has_more: false,
             editable: None,
             selection: HashSet::new(),
+            inline_edit: None,
             result,
             sort_by: None,
             sql,
@@ -336,6 +353,9 @@ pub enum ResultsAction {
         original_value: String,
     },
     ApplyEdit(EditRequest),
+    /// Inline cell edit committed via Enter or blur. Bypasses the confirm
+    /// modal — `app.rs` calls `run_edit` directly.
+    ApplyInlineEdit(EditRequest),
     /// User clicked `+ Add row`. App spawns `list_columns` and opens the
     /// insert modal once metadata lands.
     OpenInsert {
@@ -480,8 +500,30 @@ fn render_table(
     let mut delete_row_request: Option<usize> = None;
     let mut select_all_request: Option<bool> = None;
     let mut toggle_row_request: Option<(usize, bool)> = None;
+    let mut begin_inline: Option<(usize, usize, String)> = None;
+    let mut cancel_inline = false;
+    let mut commit_inline = false;
     let total_rows = tab.result.rows.len();
     let all_selected = has_checkbox && total_rows > 0 && tab.selection.len() == total_rows;
+
+    // Snapshot the inline-edit target before the body loop so the closure
+    // can read it without re-borrowing `tab`. The mutable `inline_buf` is
+    // what we hand to the TextEdit; we copy it back into `tab.inline_edit`
+    // (or to a freshly-built EditRequest) after the loop.
+    let inline_target: Option<(usize, usize)> = tab.inline_edit.as_ref().map(|s| (s.row, s.col));
+    let inline_needs_focus: bool = tab.inline_edit.as_ref().is_some_and(|s| s.needs_focus);
+    let mut inline_buf: Option<String> = tab.inline_edit.as_ref().map(|s| s.buffer.clone());
+    let pk_columns: Vec<bool> = tab
+        .result
+        .columns
+        .iter()
+        .map(|c| {
+            tab.editable
+                .as_ref()
+                .map(|t| is_pk_column(t, c))
+                .unwrap_or(false)
+        })
+        .collect();
 
     egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
@@ -559,7 +601,51 @@ fn render_table(
                         });
                         for (col_idx, cell) in cells.iter().enumerate() {
                             row.col(|ui| {
-                                let action = render_cell(ui, cell, tab.editable.is_some());
+                                let is_active_inline =
+                                    inline_target == Some((original_idx, col_idx));
+                                if is_active_inline {
+                                    let buf = inline_buf
+                                        .as_mut()
+                                        .expect("inline_buf set when inline_target is Some");
+                                    let id_salt =
+                                        ("inline-edit", tab.tab_id, original_idx, col_idx);
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .id_salt(id_salt)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                    if inline_needs_focus {
+                                        resp.request_focus();
+                                        // Select all so the user can start
+                                        // typing immediately to replace.
+                                        if let Some(mut st) =
+                                            egui::widgets::text_edit::TextEditState::load(
+                                                ui.ctx(),
+                                                resp.id,
+                                            )
+                                        {
+                                            let len = buf.chars().count();
+                                            st.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::two(
+                                                    egui::text::CCursor::new(0),
+                                                    egui::text::CCursor::new(len),
+                                                ),
+                                            ));
+                                            st.store(ui.ctx(), resp.id);
+                                        }
+                                    }
+                                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    if esc {
+                                        cancel_inline = true;
+                                    } else if resp.lost_focus() {
+                                        commit_inline = true;
+                                    }
+                                    return;
+                                }
+
+                                let is_pk = pk_columns.get(col_idx).copied().unwrap_or(false);
+                                let action = render_cell(ui, cell, tab.editable.is_some(), is_pk);
                                 match action {
                                     CellAction::None => {}
                                     CellAction::Copy => {
@@ -582,6 +668,10 @@ fn render_table(
                                     }
                                     CellAction::DeleteRow => {
                                         delete_row_request = Some(original_idx);
+                                    }
+                                    CellAction::BeginInlineEdit => {
+                                        begin_inline =
+                                            Some((original_idx, col_idx, cell.display()));
                                     }
                                 }
                             });
@@ -627,6 +717,52 @@ fn render_table(
             row,
         });
     }
+
+    // Inline-edit lifecycle. Begin always wins (the user moved on); then
+    // commit (Enter / blur), then cancel (Esc). Otherwise sync the in-
+    // progress buffer back into `tab.inline_edit` so the user's typing
+    // survives the next frame.
+    if let Some((row, col, original)) = begin_inline {
+        tab.inline_edit = Some(InlineEditState {
+            row,
+            col,
+            buffer: original.clone(),
+            original,
+            needs_focus: true,
+        });
+    } else if commit_inline {
+        if let (Some(state), Some(buf)) = (tab.inline_edit.take(), inline_buf.take()) {
+            if buf == state.original {
+                // No-op edit: just drop the editor state, no UPDATE.
+            } else if let Some(target) = tab.editable.as_ref() {
+                let row_data = tab.result.rows.get(state.row).cloned();
+                if let Some(row_data) = row_data {
+                    match build_update_sql(target, &tab.result.columns, &row_data, state.col, &buf)
+                    {
+                        Ok(sql) => {
+                            actions.push(ResultsAction::ApplyInlineEdit(EditRequest {
+                                tab_id: tab.tab_id,
+                                row: state.row,
+                                col: state.col,
+                                preview: sql.clone(),
+                                sql,
+                                new_value: buf,
+                            }));
+                        }
+                        Err(_) => {
+                            // The cell reverts to its previous display by
+                            // virtue of `inline_edit` being already None.
+                        }
+                    }
+                }
+            }
+        }
+    } else if cancel_inline {
+        tab.inline_edit = None;
+    } else if let (Some(state), Some(buf)) = (tab.inline_edit.as_mut(), inline_buf) {
+        state.buffer = buf;
+        state.needs_focus = false;
+    }
 }
 
 enum CellAction {
@@ -637,9 +773,12 @@ enum CellAction {
     /// User picked "Delete row…" from the cell context menu — the row
     /// behind the clicked cell is the target.
     DeleteRow,
+    /// User double-clicked an editable, non-PK, non-BLOB cell. The caller
+    /// promotes the cell to inline-edit mode.
+    BeginInlineEdit,
 }
 
-fn render_cell(ui: &mut egui::Ui, cell: &Cell, editable: bool) -> CellAction {
+fn render_cell(ui: &mut egui::Ui, cell: &Cell, editable: bool, is_pk: bool) -> CellAction {
     let resp = match cell {
         Cell::Null => ui.add(
             egui::Label::new(egui::RichText::new("NULL").weak().italics())
@@ -681,6 +820,11 @@ fn render_cell(ui: &mut egui::Ui, cell: &Cell, editable: bool) -> CellAction {
     };
 
     let mut out = CellAction::None;
+    // Double-click promotes the cell to inline-edit mode. PK cells are
+    // excluded (we'd lose the identifier) and BLOBs aren't text-editable.
+    if editable && !is_pk && !matches!(cell, Cell::Blob(_)) && resp.double_clicked() {
+        out = CellAction::BeginInlineEdit;
+    }
     resp.context_menu(|ui| {
         if ui.button("Copy value").clicked() {
             out = CellAction::Copy;
