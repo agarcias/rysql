@@ -52,6 +52,11 @@ pub struct RysqlApp {
     /// persists across reconnects (lives on the app, not on
     /// `ActiveConnection`).
     schema_filter: String,
+    /// Set by any close path (× button, Ctrl+W, menu, bulk-close);
+    /// consumed at the end of the frame. When true, if the now-focused
+    /// dock tab is a SQL editor, its `TextEdit` gets keyboard focus on
+    /// the next frame.
+    pending_editor_focus: bool,
     settings: AppSettings,
     settings_store: SettingsStore,
     history_store: HistoryStore,
@@ -112,6 +117,7 @@ impl RysqlApp {
             source_highlighter: Highlighter::new_dark(),
             column_edit_modal: None,
             schema_filter: String::new(),
+            pending_editor_focus: false,
             settings,
             settings_store,
             history_store,
@@ -1156,7 +1162,7 @@ impl RysqlApp {
         let tab_path = egui_dock::TabPath::new(node_path.surface, node_path.node, active_tab_idx);
         self.dock.remove_tab(tab_path);
         self.dispose_tab_state(tab);
-        self.ensure_at_least_one_editor_tab();
+        self.pending_editor_focus = true;
     }
 
     /// Free whatever backing state lives outside the dock for a tab that
@@ -1184,6 +1190,7 @@ impl RysqlApp {
     where
         F: Fn(&DockTab) -> bool,
     {
+        let mut closed_any = false;
         loop {
             let target = self.dock.iter_all_tabs().find_map(|(path, tab)| {
                 if predicate(tab) {
@@ -1195,8 +1202,11 @@ impl RysqlApp {
             let Some((path, tab)) = target else { break };
             self.dock.remove_tab(path);
             self.dispose_tab_state(tab);
+            closed_any = true;
         }
-        self.ensure_at_least_one_editor_tab();
+        if closed_any {
+            self.pending_editor_focus = true;
+        }
     }
 
     fn close_all_editor_tabs(&mut self) {
@@ -1208,15 +1218,19 @@ impl RysqlApp {
     }
 
     fn apply_dock_actions(&mut self, actions: Vec<DockAction>) {
+        let mut closed_any = false;
         for action in actions {
             match action {
                 DockAction::CloseEditorBuffer(id) => {
+                    closed_any = true;
                     self.editor.close_buffer_by_id(id);
                 }
                 DockAction::CloseResultsTab(id) => {
+                    closed_any = true;
                     self.results.remove_by_id(id);
                 }
                 DockAction::CloseObjectView(key) => {
+                    closed_any = true;
                     if let Some(state) = self.objects.remove(&key) {
                         if let Some(data_id) = state.data_tab_id() {
                             self.results.remove_by_id(data_id);
@@ -1233,7 +1247,9 @@ impl RysqlApp {
                 }
             }
         }
-        self.ensure_at_least_one_editor_tab();
+        if closed_any {
+            self.pending_editor_focus = true;
+        }
     }
 
     fn dispatch_object_request(&mut self, key: ObjectKey, action: ObjectAction) {
@@ -1489,15 +1505,25 @@ impl RysqlApp {
         self.dock.push_to_focused_leaf(DockTab::Object { key });
     }
 
-    /// UX safety net: never let the user end up looking at an empty dock.
-    /// If every tab was closed, seed a fresh empty editor.
-    fn ensure_at_least_one_editor_tab(&mut self) {
-        let has_tab = self.dock.iter_all_tabs().next().is_some();
-        if has_tab {
+    /// Consume `pending_editor_focus`: if a close path just changed the
+    /// focused dock tab to a SQL editor, request keyboard focus on its
+    /// `TextEdit` so the user can keep typing without a stray click.
+    fn focus_editor_after_close(&mut self, ctx: &egui::Context) {
+        if !self.pending_editor_focus {
             return;
         }
-        let id = self.editor.new_buffer();
-        self.dock = DockState::new(vec![DockTab::SqlEditor { buffer_id: id }]);
+        self.pending_editor_focus = false;
+        let Some(node_path) = self.dock.focused_leaf() else {
+            return;
+        };
+        let Ok(leaf) = self.dock.leaf(node_path) else {
+            return;
+        };
+        let Some(DockTab::SqlEditor { buffer_id }) = leaf.tabs.get(leaf.active.0) else {
+            return;
+        };
+        let id = egui::Id::new(("editor-textedit", *buffer_id));
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
     fn open_new_dialog(&mut self) {
@@ -2007,9 +2033,15 @@ impl eframe::App for RysqlApp {
         let schema_names = self.collect_schema_names();
         let mut dock_actions: Vec<DockAction> = Vec::new();
         let mut dock_results_actions: Vec<ResultsAction> = Vec::new();
+        let mut request_new_editor_tab = false;
+        let dock_empty = self.dock.iter_all_tabs().next().is_none();
         egui::CentralPanel::default()
             .frame(egui::Frame::default().inner_margin(egui::Margin::same(0)))
             .show_inside(ui, |ui| {
+                if dock_empty {
+                    render_empty_dock_placeholder(ui, &mut request_new_editor_tab);
+                    return;
+                }
                 let mut viewer = AppViewer::new(
                     &mut self.editor,
                     &mut self.results,
@@ -2026,6 +2058,9 @@ impl eframe::App for RysqlApp {
                 dock_actions = viewer.actions;
                 dock_results_actions = viewer.results_actions;
             });
+        if request_new_editor_tab {
+            self.open_new_editor_tab();
+        }
         self.apply_dock_actions(dock_actions);
         self.apply_results_actions(&ctx, dock_results_actions);
         self.apply_editor_actions(shortcut_actions);
@@ -2052,11 +2087,41 @@ impl eframe::App for RysqlApp {
         self.render_bulk_update_modal(&ctx);
         self.render_column_edit_modal(&ctx);
         self.render_history(&ctx);
+
+        // Last so it takes effect on the *next* frame's editor render.
+        self.focus_editor_after_close(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.disconnect();
     }
+}
+
+/// Friendly placeholder for the central panel when every tab has been
+/// closed. Offers an action button and a short hint pointing at the
+/// schema sidebar / `Ctrl+T` shortcut. The bool flag is set when the
+/// user clicks the button so the caller can dispatch
+/// `open_new_editor_tab` outside the closure.
+fn render_empty_dock_placeholder(ui: &mut egui::Ui, request_new_tab: &mut bool) {
+    let avail_h = ui.available_height();
+    ui.vertical_centered(|ui| {
+        ui.add_space(avail_h * 0.32);
+        ui.label(egui::RichText::new("No tabs open").size(24.0).weak());
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Double-click an object in the schema sidebar to inspect it,")
+                .weak(),
+        );
+        ui.label(egui::RichText::new("or open a new SQL tab to start a query.").weak());
+        ui.add_space(16.0);
+        if ui
+            .button(egui::RichText::new("+ New SQL tab").strong())
+            .on_hover_text("Ctrl+T · File → New SQL tab")
+            .clicked()
+        {
+            *request_new_tab = true;
+        }
+    });
 }
 
 fn apply_theme(ctx: &egui::Context, choice: ThemeChoice) {

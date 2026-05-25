@@ -150,6 +150,11 @@ pub fn handle_shortcuts(ctx: &egui::Context, focused: bool) -> Vec<EditorAction>
         } else if i.consume_key(egui::Modifiers::COMMAND, enter) {
             out.push(EditorAction::Execute("@cursor".into()));
         }
+        // F5 (no modifier) — DataGrip / HeidiSQL convention for "run all".
+        // Coexists with Ctrl+Shift+Enter, which keeps its existing role.
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
+            out.push(EditorAction::Execute(String::new()));
+        }
         if i.consume_key(egui::Modifiers::COMMAND, slash) {
             out.push(EditorAction::ToggleComment);
         }
@@ -288,38 +293,45 @@ pub fn render_one(
     };
 
     let before = buf.text.clone();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
+    // 8 px padding on every side so the cursor doesn't kiss the dock
+    // border. Wrapped OUTSIDE the ScrollArea so the padding stays
+    // visible while content scrolls.
+    egui::Frame::default()
+        .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            let output = egui::TextEdit::multiline(&mut buf.text)
-                .id(textedit_id)
-                .font(egui::TextStyle::Monospace)
-                .code_editor()
-                .desired_width(f32::INFINITY)
-                .desired_rows(20)
-                .layouter(&mut layouter)
-                .show(ui);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    let output = egui::TextEdit::multiline(&mut buf.text)
+                        .id(textedit_id)
+                        .font(egui::TextStyle::Monospace)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(20)
+                        .layouter(&mut layouter)
+                        .show(ui);
 
-            if buf.text != before {
-                buf.dirty = true;
-            }
-            focused = output.response.has_focus();
-            if let Some(range) = output.cursor_range {
-                let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
-                let secondary_byte = byte_index_from_char(&buf.text, range.secondary.index);
-                new_cursor = Some(primary_byte);
-                new_selection = Some((
-                    primary_byte.min(secondary_byte),
-                    primary_byte.max(secondary_byte),
-                ));
+                    if buf.text != before {
+                        buf.dirty = true;
+                    }
+                    focused = output.response.has_focus();
+                    if let Some(range) = output.cursor_range {
+                        let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
+                        let secondary_byte = byte_index_from_char(&buf.text, range.secondary.index);
+                        new_cursor = Some(primary_byte);
+                        new_selection = Some((
+                            primary_byte.min(secondary_byte),
+                            primary_byte.max(secondary_byte),
+                        ));
 
-                // Popup anchor: just below the cursor in screen space.
-                let rect = output.galley.pos_from_cursor(range.primary);
-                popup_anchor = Some(egui::Pos2 {
-                    x: output.galley_pos.x + rect.min.x,
-                    y: output.galley_pos.y + rect.max.y + 2.0,
+                        // Popup anchor: just below the cursor in screen space.
+                        let rect = output.galley.pos_from_cursor(range.primary);
+                        popup_anchor = Some(egui::Pos2 {
+                            x: output.galley_pos.x + rect.min.x,
+                            y: output.galley_pos.y + rect.max.y + 2.0,
+                        });
+                    }
                 });
-            }
         });
 
     // Keep cursor/selection/autocomplete tied to the focused buffer so

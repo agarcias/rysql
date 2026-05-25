@@ -139,17 +139,6 @@ fn default_sub(kind: ObjectKind) -> SubTab {
     }
 }
 
-fn kind_icon(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Table => "🗃",
-        ObjectKind::View => "👁",
-        ObjectKind::Procedure => "⚙",
-        ObjectKind::Function => "ƒ",
-        ObjectKind::Trigger => "⚡",
-        ObjectKind::Event => "⏰",
-    }
-}
-
 fn kind_label(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Table => "Table",
@@ -177,7 +166,7 @@ pub fn render(
                 ui.label(
                     egui::RichText::new(format!(
                         "{} {} · {}.{}",
-                        kind_icon(state.kind),
+                        state.kind.short_label(),
                         kind_label(state.kind),
                         state.db,
                         state.name,

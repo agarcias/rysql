@@ -347,14 +347,19 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
+    /// Single-glyph badge shown next to the object name in the sidebar and
+    /// the Object inspector header. Plain BMP code points so the system
+    /// font fallback always finds a glyph (no emoji-font dependency).
     pub fn short_label(self) -> &'static str {
         match self {
-            ObjectKind::Table => "T",
-            ObjectKind::View => "V",
-            ObjectKind::Procedure => "P",
-            ObjectKind::Function => "F",
-            ObjectKind::Trigger => "Tr",
-            ObjectKind::Event => "E",
+            // U+25A6 SQUARE WITH ORTHOGONAL CROSSHATCH FILL — looks like
+            // a 2x2 grid of cells, the universal "table" silhouette.
+            ObjectKind::Table => "▦",
+            ObjectKind::View => "👁",
+            ObjectKind::Procedure => "⚙",
+            ObjectKind::Function => "ƒ",
+            ObjectKind::Trigger => "⚡",
+            ObjectKind::Event => "⏰",
         }
     }
 
