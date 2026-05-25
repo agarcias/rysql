@@ -93,4 +93,14 @@ pub enum PendingExec {
         tab_id: u64,
         rows: Vec<usize>,
     },
+    /// Set the same value on the same column across several rows. After
+    /// execute we patch the cells locally; no server refresh.
+    BulkUpdate {
+        tab_id: u64,
+        rows: Vec<usize>,
+        col_idx: usize,
+        /// Either the literal the user typed or the string "NULL" — the
+        /// post-exec handler turns it into `Cell::Null` / `Cell::Text`.
+        new_value: String,
+    },
 }

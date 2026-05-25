@@ -150,6 +150,15 @@ pub enum ExecKind {
     /// `tab.result.rows` (original, not display) are carried so the
     /// handler can drop them locally without a server refresh.
     DeletedRows { tab_id: u64, rows: Vec<usize> },
+    /// A bulk UPDATE just landed: same `col_idx` across the listed rows
+    /// gets `new_value` (turned into `Cell::Null` or `Cell::Text` by the
+    /// handler).
+    BulkUpdated {
+        tab_id: u64,
+        rows: Vec<usize>,
+        col_idx: usize,
+        new_value: String,
+    },
 }
 
 pub struct Bridge {

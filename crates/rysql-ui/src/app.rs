@@ -19,8 +19,8 @@ use crate::object_view::{self, ObjectAction, ObjectViewState};
 #[allow(unused_imports)]
 use crate::results::EditRequest;
 use crate::results::{
-    self, EditCellState, EditDialogChoice, ExportFormat, InsertChoice, InsertRowState, ResultTab,
-    ResultsAction, ResultsState,
+    self, BulkUpdateChoice, EditCellState, EditDialogChoice, ExportFormat, InsertChoice,
+    InsertRowState, ResultTab, ResultsAction, ResultsState,
 };
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{
@@ -528,7 +528,46 @@ impl RysqlApp {
             ExecKind::DeletedRows { tab_id, rows } => {
                 self.apply_local_delete(*tab_id, rows);
             }
+            ExecKind::BulkUpdated {
+                tab_id,
+                rows,
+                col_idx,
+                new_value,
+            } => {
+                self.apply_local_bulk_update(*tab_id, rows, *col_idx, new_value);
+            }
         }
+    }
+
+    /// Patch every selected row's column with `new_value`. No server
+    /// round-trip: we trust the server accepted the UPDATE (otherwise we
+    /// would have stayed in the `Err` branch of `handle_events::ExecResult`).
+    fn apply_local_bulk_update(
+        &mut self,
+        tab_id: u64,
+        rows: &[usize],
+        col_idx: usize,
+        new_value: &str,
+    ) {
+        use rysql_db::Cell;
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let tab = &mut self.results.tabs[idx];
+        let new_cell = if new_value.eq_ignore_ascii_case("NULL") {
+            Cell::Null
+        } else {
+            Cell::Text(new_value.to_string())
+        };
+        for &row_idx in rows {
+            if let Some(row) = tab.result.rows.get_mut(row_idx) {
+                if let Some(cell) = row.get_mut(col_idx) {
+                    *cell = new_cell.clone();
+                }
+            }
+        }
+        tab.selection.clear();
+        tab.apply_sort();
     }
 
     /// Drop the just-deleted rows from the local grid. No server refresh:
@@ -854,8 +893,47 @@ impl RysqlApp {
                     }
                     self.open_delete_confirm(tab_id, rows);
                 }
+                ResultsAction::OpenBulkUpdate { tab_id } => self.open_bulk_update_modal(tab_id),
             }
         }
+    }
+
+    /// Open the bulk-update modal for the rows currently in `tab.selection`.
+    /// Seeds the column dropdown with the first non-PK column so the modal
+    /// is usable on the first click.
+    fn open_bulk_update_modal(&mut self, tab_id: u64) {
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let tab = &self.results.tabs[idx];
+        let Some(target) = tab.editable.as_ref() else {
+            self.last_info = Some("Result is not editable (need a single-table origin)".into());
+            return;
+        };
+        if target.pk_cols.is_empty() {
+            self.last_info = Some("No primary key detected — cannot bulk update".into());
+            return;
+        }
+        let mut selected_rows: Vec<usize> = tab.selection.iter().copied().collect();
+        selected_rows.sort_unstable();
+        if selected_rows.len() < 2 {
+            self.last_info = Some("Select at least 2 rows for a bulk update".into());
+            return;
+        }
+        let target = target.clone();
+        let columns = tab.result.columns.clone();
+        let selected_col = columns
+            .iter()
+            .position(|c| !results::is_pk_column(&target, c));
+        self.results.bulk_update_modal = Some(results::BulkUpdateState {
+            tab_id,
+            target,
+            columns,
+            selected_rows,
+            selected_col,
+            mode: results::BulkValueMode::Value,
+            value: String::new(),
+        });
     }
 
     /// Build the DELETE SQL for the given row indices and push the
@@ -1517,6 +1595,17 @@ impl RysqlApp {
                 tab_id: *tab_id,
                 rows: rows.clone(),
             },
+            PendingExec::BulkUpdate {
+                tab_id,
+                rows,
+                col_idx,
+                new_value,
+            } => ExecKind::BulkUpdated {
+                tab_id: *tab_id,
+                rows: rows.clone(),
+                col_idx: *col_idx,
+                new_value: new_value.clone(),
+            },
             PendingExec::EditCell(_) | PendingExec::ReplaceSource { .. } => unreachable!(),
         };
         let sql = action.sql.clone();
@@ -1820,6 +1909,7 @@ impl eframe::App for RysqlApp {
 
         self.render_edit_modal(&ctx);
         self.render_insert_modal(&ctx);
+        self.render_bulk_update_modal(&ctx);
         self.render_history(&ctx);
     }
 
@@ -1940,6 +2030,52 @@ impl RysqlApp {
                     sql,
                     kind: PendingExec::InsertRow {
                         tab_id: state.tab_id,
+                    },
+                });
+                self.confirm_typed.clear();
+            }
+        }
+    }
+
+    fn render_bulk_update_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.results.bulk_update_modal.take() else {
+            return;
+        };
+        // The preview builder reads from the live `tab.result.rows`; if the
+        // tab vanished while the modal was open we just close.
+        let rows = match self.results.find_by_id(state.tab_id) {
+            Some(idx) => self.results.tabs[idx].result.rows.clone(),
+            None => return,
+        };
+        let choice = results::render_bulk_update_modal(ctx, &mut state, &rows);
+        match choice {
+            BulkUpdateChoice::None => {
+                self.results.bulk_update_modal = Some(state);
+            }
+            BulkUpdateChoice::Cancel => {
+                // dropped
+            }
+            BulkUpdateChoice::Submit {
+                sql,
+                col_idx,
+                new_value,
+            } => {
+                let count = state.selected_rows.len();
+                self.confirm = Some(ConfirmAction {
+                    title: format!(
+                        "Update {count} row(s) in `{}`.`{}`",
+                        state.target.db, state.target.table
+                    ),
+                    message: format!(
+                        "Apply this UPDATE to {count} row(s)? Selected cells \
+                         will reflect the new value immediately on success."
+                    ),
+                    sql,
+                    kind: PendingExec::BulkUpdate {
+                        tab_id: state.tab_id,
+                        rows: state.selected_rows.clone(),
+                        col_idx,
+                        new_value,
                     },
                 });
                 self.confirm_typed.clear();

@@ -230,6 +230,35 @@ fn suggest_initial_value(col: &ColumnInfo) -> InsertValue {
     }
 }
 
+/// Two-way value selector for the bulk-update modal: a literal or
+/// `NULL`. `DEFAULT` is not offered — bulk updates always set an explicit
+/// value (use single-cell edit if you need finer control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkValueMode {
+    Value,
+    Null,
+}
+
+/// State for the "Bulk edit column" modal opened from the toolbar when
+/// `tab.selection` has 2+ rows. The user picks one non-PK column and one
+/// value; the resulting UPDATE patches every selected row.
+#[derive(Debug, Clone)]
+pub struct BulkUpdateState {
+    pub tab_id: u64,
+    pub target: EditableTarget,
+    /// A copy of `tab.result.columns` so the modal can survive an
+    /// underlying sort/refresh while open.
+    pub columns: Vec<ColumnMeta>,
+    /// Original-index rows from `tab.selection`, sorted for a stable
+    /// SQL preview.
+    pub selected_rows: Vec<usize>,
+    /// Position in `columns`. `None` until the user picks one (defaults
+    /// to the first non-PK column when the modal opens).
+    pub selected_col: Option<usize>,
+    pub mode: BulkValueMode,
+    pub value: String,
+}
+
 #[derive(Default)]
 pub struct ResultsState {
     pub tabs: Vec<ResultTab>,
@@ -237,6 +266,7 @@ pub struct ResultsState {
     pub blob_viewer: Option<BlobViewState>,
     pub edit_modal: Option<EditCellState>,
     pub insert_modal: Option<InsertRowState>,
+    pub bulk_update_modal: Option<BulkUpdateState>,
 }
 
 /// Hard cap on the number of result tabs we keep around simultaneously. The
@@ -322,6 +352,11 @@ pub enum ResultsAction {
     OpenBulkDelete {
         tab_id: u64,
     },
+    /// User clicked `Bulk edit column…`; the app reads `tab.selection` and
+    /// opens the bulk-update modal.
+    OpenBulkUpdate {
+        tab_id: u64,
+    },
 }
 
 /// Render a single result tab's body (footer + grid). The dock owns the tab
@@ -344,7 +379,8 @@ pub fn render_one(
     let tab = &mut tabs[idx];
 
     // Top toolbar: only meaningful when the tab is editable (single-table,
-    // PK detected). Hosts `+ Add row` and the bulk-delete button.
+    // PK detected). Hosts `+ Add row`, the bulk-delete button, and the
+    // bulk-edit-column button.
     if tab.editable.is_some() {
         let selection_count = tab.selection.len();
         egui::Panel::top(egui::Id::new(("results-toolbar", tab_id)))
@@ -353,6 +389,14 @@ pub fn render_one(
                 ui.horizontal(|ui| {
                     if ui.button("+ Add row").clicked() {
                         actions.push(ResultsAction::OpenInsert { tab_id });
+                    }
+                    // Bulk update needs at least 2 rows — for a single row
+                    // the user has the per-cell "Edit cell…" path.
+                    if selection_count >= 2 {
+                        ui.separator();
+                        if ui.button("Bulk edit column…").clicked() {
+                            actions.push(ResultsAction::OpenBulkUpdate { tab_id });
+                        }
                     }
                     if selection_count > 0 {
                         ui.separator();
@@ -1330,4 +1374,273 @@ pub fn build_delete_sql(
             tuple_strs.join(", ")
         ))
     }
+}
+
+// ===== Bulk update =====
+
+pub enum BulkUpdateChoice {
+    None,
+    Cancel,
+    Submit {
+        sql: String,
+        col_idx: usize,
+        new_value: String,
+    },
+}
+
+/// `true` when `col` is one of the table's primary-key columns. The
+/// bulk-update column dropdown filters these out so the user can't
+/// accidentally rewrite the keys we use to identify the rows.
+pub fn is_pk_column(target: &EditableTarget, col: &ColumnMeta) -> bool {
+    let candidate = col.original_name.as_deref().unwrap_or(col.name.as_str());
+    target.pk_cols.iter().any(|pk| pk == candidate)
+}
+
+/// Build `UPDATE db.tbl SET col = literal WHERE <pk predicate>`. The
+/// predicate reuses the same branching as [`build_delete_sql`].
+pub fn build_bulk_update_sql(
+    target: &EditableTarget,
+    columns: &[ColumnMeta],
+    rows: &[Vec<Cell>],
+    row_indices: &[usize],
+    col_idx: usize,
+    mode: BulkValueMode,
+    value: &str,
+) -> Result<String, String> {
+    if target.pk_cols.is_empty() {
+        return Err("no primary key available".into());
+    }
+    if row_indices.is_empty() {
+        return Err("no rows selected".into());
+    }
+    let col = columns
+        .get(col_idx)
+        .ok_or_else(|| "column out of range".to_string())?;
+    if is_pk_column(target, col) {
+        return Err(format!("`{}` is a primary-key column", col.name));
+    }
+    let col_name = col
+        .original_name
+        .clone()
+        .unwrap_or_else(|| col.name.clone());
+
+    // Resolve PK column positions for the WHERE predicate.
+    let mut pk_col_indices = Vec::with_capacity(target.pk_cols.len());
+    for pk in &target.pk_cols {
+        let i = columns
+            .iter()
+            .position(|c| c.original_name.as_deref() == Some(pk.as_str()) || c.name == *pk)
+            .ok_or_else(|| format!("PK column `{pk}` not present in result"))?;
+        pk_col_indices.push(i);
+    }
+
+    // Collect PK literals per selected row.
+    let mut tuples: Vec<Vec<String>> = Vec::with_capacity(row_indices.len());
+    for &row_idx in row_indices {
+        let row = rows
+            .get(row_idx)
+            .ok_or_else(|| format!("row index {row_idx} out of range"))?;
+        let mut tuple = Vec::with_capacity(pk_col_indices.len());
+        for (k, &col_idx) in pk_col_indices.iter().enumerate() {
+            let cell = row
+                .get(col_idx)
+                .ok_or_else(|| "row too short for PK".to_string())?;
+            let literal = sql_literal(cell);
+            if literal.starts_with("NULL") {
+                return Err(format!(
+                    "PK column `{}` is NULL — cannot update row",
+                    target.pk_cols[k]
+                ));
+            }
+            tuple.push(literal);
+        }
+        tuples.push(tuple);
+    }
+
+    let set_value = match mode {
+        BulkValueMode::Null => "NULL".to_string(),
+        BulkValueMode::Value => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
+    };
+
+    let db = target.db.replace('`', "``");
+    let table = target.table.replace('`', "``");
+
+    let where_clause = if target.pk_cols.len() == 1 {
+        let pk = target.pk_cols[0].replace('`', "``");
+        if tuples.len() == 1 {
+            format!("`{pk}` = {}", tuples[0][0])
+        } else {
+            let values: Vec<String> = tuples
+                .into_iter()
+                .map(|t| t.into_iter().next().unwrap())
+                .collect();
+            format!("`{pk}` IN ({})", values.join(", "))
+        }
+    } else {
+        let cols_list: Vec<String> = target
+            .pk_cols
+            .iter()
+            .map(|p| format!("`{}`", p.replace('`', "``")))
+            .collect();
+        let tuple_strs: Vec<String> = tuples
+            .iter()
+            .map(|t| format!("({})", t.join(", ")))
+            .collect();
+        if tuple_strs.len() == 1 {
+            format!("({}) = {}", cols_list.join(", "), tuple_strs[0])
+        } else {
+            format!("({}) IN ({})", cols_list.join(", "), tuple_strs.join(", "))
+        }
+    };
+
+    Ok(format!(
+        "UPDATE `{db}`.`{table}` SET `{}` = {} WHERE {}",
+        col_name.replace('`', "``"),
+        set_value,
+        where_clause
+    ))
+}
+
+pub fn render_bulk_update_modal(
+    ctx: &egui::Context,
+    state: &mut BulkUpdateState,
+    rows: &[Vec<Cell>],
+) -> BulkUpdateChoice {
+    let mut choice = BulkUpdateChoice::None;
+    egui::Modal::new(egui::Id::new("bulk-update-modal")).show(ctx, |ui| {
+        ui.set_min_width(820.0);
+        ui.heading(format!(
+            "Bulk edit column · {} selected row(s) in `{}`.`{}`",
+            state.selected_rows.len(),
+            state.target.db,
+            state.target.table
+        ));
+        ui.label(
+            egui::RichText::new(
+                "Primary-key columns are hidden from the dropdown — the bulk \
+                 UPDATE identifies rows by PK so rewriting it would be unsafe.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(8.0);
+
+        egui::Grid::new("bulk-update-grid")
+            .num_columns(2)
+            .spacing([12.0, 10.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Column").strong());
+                let current_label = match state.selected_col {
+                    Some(i) => state
+                        .columns
+                        .get(i)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| "(out of range)".into()),
+                    None => "(pick a column)".into(),
+                };
+                egui::ComboBox::from_id_salt("bulk-update-col")
+                    .selected_text(current_label)
+                    .width(360.0)
+                    .show_ui(ui, |ui| {
+                        for (i, col) in state.columns.iter().enumerate() {
+                            if is_pk_column(&state.target, col) {
+                                continue;
+                            }
+                            ui.selectable_value(
+                                &mut state.selected_col,
+                                Some(i),
+                                format!("{}  {}", col.name, col.type_name),
+                            );
+                        }
+                    });
+                ui.end_row();
+
+                ui.label(egui::RichText::new("New value").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut state.mode, BulkValueMode::Value, "Value");
+                    ui.add_space(8.0);
+                    ui.radio_value(&mut state.mode, BulkValueMode::Null, "NULL");
+                });
+                ui.end_row();
+
+                ui.label("");
+                match state.mode {
+                    BulkValueMode::Value => {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.value)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    }
+                    BulkValueMode::Null => {
+                        let mut placeholder = String::from("NULL");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut placeholder)
+                                .interactive(false)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    }
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Preview SQL").weak().small());
+        let preview = state.selected_col.and_then(|col_idx| {
+            build_bulk_update_sql(
+                &state.target,
+                &state.columns,
+                rows,
+                &state.selected_rows,
+                col_idx,
+                state.mode,
+                &state.value,
+            )
+            .ok()
+        });
+        let mut sql_display = preview
+            .clone()
+            .unwrap_or_else(|| "(pick a column to preview)".into());
+        egui::ScrollArea::vertical()
+            .id_salt("bulk-update-preview-scroll")
+            .max_height(220.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut sql_display)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                choice = BulkUpdateChoice::Cancel;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enabled = preview.is_some();
+                let btn = egui::Button::new(
+                    egui::RichText::new("Update…").color(egui::Color32::from_rgb(0xff, 0xb7, 0x4d)),
+                );
+                if ui.add_enabled(enabled, btn).clicked() {
+                    if let (Some(sql), Some(col_idx)) = (preview, state.selected_col) {
+                        choice = BulkUpdateChoice::Submit {
+                            sql,
+                            col_idx,
+                            new_value: match state.mode {
+                                BulkValueMode::Null => "NULL".to_string(),
+                                BulkValueMode::Value => state.value.clone(),
+                            },
+                        };
+                    }
+                }
+            });
+        });
+    });
+    choice
 }

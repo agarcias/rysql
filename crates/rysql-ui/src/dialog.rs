@@ -285,6 +285,9 @@ fn confirm_target(action: &ConfirmAction) -> Option<String> {
         // exact PKs being affected; a type-to-confirm gate on top of that
         // would be friction without safety.
         PendingExec::DeleteRows { .. } => None,
+        // Bulk UPDATE is non-destructive (rows aren't lost, only one
+        // column changes); same reasoning as InsertRow.
+        PendingExec::BulkUpdate { .. } => None,
     }
 }
 
@@ -298,5 +301,6 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::ReplaceSource { .. } => "routine",
         PendingExec::InsertRow { .. } => "row",
         PendingExec::DeleteRows { .. } => "rows",
+        PendingExec::BulkUpdate { .. } => "rows",
     }
 }
