@@ -28,8 +28,13 @@ pub async fn build_pool(profile: &ConnectionProfile, password: &str) -> Result<M
         opts = opts.socket(sock);
     }
 
+    // Single connection per profile: the DbActor already serializes commands,
+    // and capping at 1 guarantees that session state set by `USE db`,
+    // `SET @var = …`, `SET autocommit = 0`, temporary tables, etc. survives
+    // across subsequent statements (with a larger pool each statement may land
+    // on a different physical connection and lose that state).
     let pool = MySqlPoolOptions::new()
-        .max_connections(4)
+        .max_connections(1)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Some(Duration::from_secs(300)))
