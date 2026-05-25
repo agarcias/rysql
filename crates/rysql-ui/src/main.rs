@@ -3,6 +3,7 @@ use eframe::egui;
 mod app;
 mod bridge;
 mod dialog;
+mod dock;
 mod editor;
 mod fonts;
 mod history_view;

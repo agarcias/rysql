@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use eframe::egui;
+use egui_dock::{DockArea, DockState, Style};
 use rysql_core::{
     secret, store::ProfileStore, AppSettings, ConnectionProfile, HistoryEntry, HistoryStore,
     SettingsStore, ThemeChoice,
@@ -10,6 +11,7 @@ use tokio::task::AbortHandle;
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
+use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
 use crate::history_view::{self, HistoryAction, HistoryView};
 #[allow(unused_imports)]
@@ -32,6 +34,7 @@ pub struct RysqlApp {
     confirm: Option<ConfirmAction>,
     confirm_typed: String,
     editor: EditorState,
+    dock: DockState<DockTab>,
     results: ResultsState,
     settings: AppSettings,
     settings_store: SettingsStore,
@@ -62,6 +65,19 @@ impl RysqlApp {
         let history_store =
             HistoryStore::locate(settings.history_limit.max(1)).expect("locate data dir");
 
+        let editor = EditorState::default();
+        // `EditorState::default()` seeds one buffer ("query-1"); the dock
+        // boots with a matching `SqlEditor` tab so the user sees the same
+        // empty editor at startup as before the refactor.
+        let initial_buffer_id = editor
+            .buffers
+            .first()
+            .map(|b| b.id)
+            .expect("EditorState::default seeds one buffer");
+        let dock = DockState::new(vec![DockTab::SqlEditor {
+            buffer_id: initial_buffer_id,
+        }]);
+
         Self {
             bridge,
             store,
@@ -73,7 +89,8 @@ impl RysqlApp {
             last_info: None,
             confirm: None,
             confirm_typed: String::new(),
-            editor: EditorState::default(),
+            editor,
+            dock,
             results: ResultsState::default(),
             settings,
             settings_store,
@@ -600,20 +617,8 @@ impl RysqlApp {
     fn apply_editor_actions(&mut self, actions: Vec<EditorAction>) {
         for action in actions {
             match action {
-                EditorAction::NewTab => {
-                    self.editor.new_buffer();
-                }
-                EditorAction::SelectTab(idx) => {
-                    if idx < self.editor.buffers.len() {
-                        self.editor.active = idx;
-                    }
-                }
-                EditorAction::CloseTab(mut idx) => {
-                    if idx == usize::MAX {
-                        idx = self.editor.active;
-                    }
-                    self.editor.close_buffer(idx);
-                }
+                EditorAction::NewTab => self.open_new_editor_tab(),
+                EditorAction::CloseTab => self.close_focused_editor_tab(),
                 EditorAction::Format => editor::apply_format(&mut self.editor),
                 EditorAction::ToggleComment => editor::apply_toggle_comment(&mut self.editor),
                 EditorAction::Execute(arg) => {
@@ -625,6 +630,61 @@ impl RysqlApp {
                 }
             }
         }
+    }
+
+    fn open_new_editor_tab(&mut self) {
+        let id = self.editor.new_buffer();
+        self.dock
+            .push_to_focused_leaf(DockTab::SqlEditor { buffer_id: id });
+    }
+
+    /// Close the editor tab in the currently-focused leaf, if any.
+    /// `on_close` on the viewer records a [`DockAction::CloseEditorBuffer`]
+    /// only when the user clicks the tab's close button; for shortcut-driven
+    /// closes we drive both sides here.
+    fn close_focused_editor_tab(&mut self) {
+        let Some(node_path) = self.dock.focused_leaf() else {
+            return;
+        };
+        let Ok(leaf) = self.dock.leaf(node_path) else {
+            return;
+        };
+        let active_tab_idx = leaf.active;
+        let Some(DockTab::SqlEditor { buffer_id }) = leaf.tabs.get(active_tab_idx.0).cloned()
+        else {
+            return;
+        };
+        let tab_path = egui_dock::TabPath::new(node_path.surface, node_path.node, active_tab_idx);
+        self.dock.remove_tab(tab_path);
+        self.editor.close_buffer_by_id(buffer_id);
+        self.ensure_at_least_one_editor_tab();
+    }
+
+    fn apply_dock_actions(&mut self, actions: Vec<DockAction>) {
+        for action in actions {
+            match action {
+                DockAction::CloseEditorBuffer(id) => {
+                    self.editor.close_buffer_by_id(id);
+                }
+                DockAction::FocusedEditor(id) => {
+                    if let Some(idx) = self.editor.buffer_index(id) {
+                        self.editor.active = idx;
+                    }
+                }
+            }
+        }
+        self.ensure_at_least_one_editor_tab();
+    }
+
+    /// UX safety net: never let the user end up looking at an empty dock.
+    /// If every tab was closed, seed a fresh empty editor.
+    fn ensure_at_least_one_editor_tab(&mut self) {
+        let has_tab = self.dock.iter_all_tabs().next().is_some();
+        if has_tab {
+            return;
+        }
+        let id = self.editor.new_buffer();
+        self.dock = DockState::new(vec![DockTab::SqlEditor { buffer_id: id }]);
     }
 
     fn open_new_dialog(&mut self) {
@@ -1066,15 +1126,21 @@ impl eframe::App for RysqlApp {
         self.apply_results_actions(&ctx, results_actions);
 
         let schema_names = self.collect_schema_names();
-        let mut editor_actions = Vec::new();
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            let ec = editor::EditorContext {
-                schema_names: &schema_names,
-            };
-            editor_actions = editor::render(ui, &mut self.editor, ec);
-        });
-        editor_actions.extend(shortcut_actions);
-        self.apply_editor_actions(editor_actions);
+        let mut dock_actions: Vec<DockAction> = Vec::new();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().inner_margin(egui::Margin::same(0)))
+            .show_inside(ui, |ui| {
+                let mut viewer = AppViewer::new(&mut self.editor, &schema_names);
+                DockArea::new(&mut self.dock)
+                    .style(Style::from_egui(ui.style().as_ref()))
+                    .show_close_buttons(true)
+                    .show_add_buttons(false)
+                    .draggable_tabs(true)
+                    .show_inside(ui, &mut viewer);
+                dock_actions = viewer.actions;
+            });
+        self.apply_dock_actions(dock_actions);
+        self.apply_editor_actions(shortcut_actions);
 
         self.render_dialog(&ctx);
         self.render_confirm(&ctx);

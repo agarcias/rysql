@@ -8,14 +8,16 @@ use eframe::egui::{
 use rysql_sql::{format_sql, statement_at_cursor, HighlightSpan, Highlighter, SQL_KEYWORDS};
 
 pub struct Buffer {
+    pub id: u64,
     pub name: String,
     pub text: String,
     pub dirty: bool,
 }
 
 impl Buffer {
-    fn new(name: String) -> Self {
+    fn new(id: u64, name: String) -> Self {
         Self {
+            id,
             name,
             text: String::new(),
             dirty: false,
@@ -36,8 +38,12 @@ pub struct AutocompleteState {
 
 pub struct EditorState {
     pub buffers: Vec<Buffer>,
+    /// Index of the buffer that currently has user focus. Updated by
+    /// [`render_one`] each time a buffer's TextEdit is interacted with.
+    /// Shortcut handlers (`apply_format`, `apply_toggle_comment`,
+    /// `resolve_execute`) operate on this buffer.
     pub active: usize,
-    pub next_id: usize,
+    pub next_id: u64,
     pub highlighter: Highlighter,
     /// Last known caret byte (primary cursor end), updated each frame.
     pub last_cursor: Option<usize>,
@@ -63,15 +69,18 @@ impl Default for EditorState {
 }
 
 impl EditorState {
-    pub fn new_buffer(&mut self) -> usize {
+    /// Create a new buffer named `query-N` and append it to `buffers`.
+    /// Returns the stable `buffer_id` of the newly-created buffer.
+    pub fn new_buffer(&mut self) -> u64 {
         self.next_id += 1;
-        let name = format!("query-{}", self.next_id);
-        self.buffers.push(Buffer::new(name));
+        let id = self.next_id;
+        let name = format!("query-{id}");
+        self.buffers.push(Buffer::new(id, name));
         self.active = self.buffers.len() - 1;
         self.last_cursor = None;
         self.last_selection = None;
         self.autocomplete = None;
-        self.active
+        id
     }
 
     pub fn close_buffer(&mut self, idx: usize) {
@@ -79,9 +88,7 @@ impl EditorState {
             return;
         }
         self.buffers.remove(idx);
-        if self.buffers.is_empty() {
-            self.new_buffer();
-        } else if self.active >= self.buffers.len() {
+        if self.active >= self.buffers.len() && !self.buffers.is_empty() {
             self.active = self.buffers.len() - 1;
         }
         self.last_cursor = None;
@@ -89,16 +96,30 @@ impl EditorState {
         self.autocomplete = None;
     }
 
+    /// Remove the buffer with the given stable id. No-op if missing.
+    pub fn close_buffer_by_id(&mut self, id: u64) {
+        if let Some(idx) = self.buffer_index(id) {
+            self.close_buffer(idx);
+        }
+    }
+
     pub fn active_buffer(&self) -> Option<&Buffer> {
         self.buffers.get(self.active)
+    }
+
+    pub fn buffer_by_id(&self, id: u64) -> Option<&Buffer> {
+        self.buffers.iter().find(|b| b.id == id)
+    }
+
+    pub fn buffer_index(&self, id: u64) -> Option<usize> {
+        self.buffers.iter().position(|b| b.id == id)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum EditorAction {
     NewTab,
-    SelectTab(usize),
-    CloseTab(usize),
+    CloseTab,
     Execute(String),
     Format,
     ToggleComment,
@@ -139,7 +160,7 @@ pub fn handle_shortcuts(ctx: &egui::Context, focused: bool) -> Vec<EditorAction>
             out.push(EditorAction::NewTab);
         }
         if i.consume_key(egui::Modifiers::COMMAND, w) {
-            out.push(EditorAction::CloseTab(usize::MAX));
+            out.push(EditorAction::CloseTab);
         }
     });
     out
@@ -171,48 +192,30 @@ fn consume_autocomplete_keys(ctx: &egui::Context) -> Option<AcKey> {
     })
 }
 
-pub fn render(
+/// Render a single editor buffer's body (no tab strip — the dock provides
+/// tabs). Returns `true` if the underlying TextEdit currently has focus, so
+/// the caller can track which buffer is "active" for shortcut routing.
+pub fn render_one(
     ui: &mut egui::Ui,
     state: &mut EditorState,
+    buffer_id: u64,
     ctx_in: EditorContext<'_>,
-) -> Vec<EditorAction> {
-    let mut actions = Vec::new();
+) -> bool {
+    let Some(buf_idx) = state.buffer_index(buffer_id) else {
+        ui.label("Buffer closed");
+        return false;
+    };
     let egui_ctx = ui.ctx().clone();
 
-    egui::Panel::top("editor-tab-strip")
-        .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
-        .show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut to_close: Option<usize> = None;
-                for (idx, buf) in state.buffers.iter().enumerate() {
-                    let is_active = idx == state.active;
-                    let label = if buf.dirty {
-                        format!("● {}", buf.name)
-                    } else {
-                        buf.name.clone()
-                    };
-                    let resp = ui.selectable_label(is_active, label);
-                    if resp.clicked() && !is_active {
-                        actions.push(EditorAction::SelectTab(idx));
-                    }
-                    if ui.small_button("×").on_hover_text("Close tab").clicked() {
-                        to_close = Some(idx);
-                    }
-                    ui.separator();
-                }
-                if ui.button("+ New").clicked() {
-                    actions.push(EditorAction::NewTab);
-                }
-                if let Some(i) = to_close {
-                    actions.push(EditorAction::CloseTab(i));
-                }
-            });
-        });
-
-    let textedit_id = egui::Id::new(("editor-textedit", state.active));
+    // Stable per-buffer id so the egui TextEditState (cursor, selection)
+    // survives moving the tab between leaves.
+    let textedit_id = egui::Id::new(("editor-textedit", buffer_id));
 
     // === Pre-frame: handle autocomplete keys before TextEdit sees them. ===
-    let ac_key = if state.autocomplete.is_some() {
+    // Only intercept if this buffer is the focused one (otherwise an unfocused
+    // editor in a split would steal arrow keys).
+    let is_active = state.active == buf_idx;
+    let ac_key = if is_active && state.autocomplete.is_some() {
         consume_autocomplete_keys(&egui_ctx)
     } else {
         None
@@ -239,7 +242,7 @@ pub fn render(
             }
             AcKey::Accept => {
                 if let Some(ac) = state.autocomplete.take() {
-                    if let Some(buf) = state.buffers.get_mut(state.active) {
+                    if let Some(buf) = state.buffers.get_mut(buf_idx) {
                         let suggestion = ac.suggestions[ac.selected].clone();
                         let end = ac.start_byte + ac.prefix.len();
                         if end <= buf.text.len() {
@@ -266,70 +269,71 @@ pub fn render(
     let mut new_cursor: Option<usize> = None;
     let mut new_selection: Option<(usize, usize)> = None;
     let mut popup_anchor: Option<egui::Pos2> = None;
+    let mut focused = false;
 
-    egui::CentralPanel::default()
-        .frame(egui::Frame::default().inner_margin(egui::Margin::same(0)))
-        .show_inside(ui, |ui| {
-            let Some(buf) = state.buffers.get_mut(state.active) else {
-                ui.label("No buffer");
-                return;
-            };
+    let Some(buf) = state.buffers.get_mut(buf_idx) else {
+        return false;
+    };
 
-            let highlighter = &mut state.highlighter;
-            let mut layouter =
-                move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let mut job = build_layout_job(text.as_str(), highlighter, ui);
-                    job.wrap.max_width = wrap_width;
-                    ui.ctx().fonts_mut(|f| f.layout_job(job))
-                };
+    let highlighter = &mut state.highlighter;
+    let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+        let mut job = build_layout_job(text.as_str(), highlighter, ui);
+        job.wrap.max_width = wrap_width;
+        ui.ctx().fonts_mut(|f| f.layout_job(job))
+    };
 
-            let before = buf.text.clone();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    let output = egui::TextEdit::multiline(&mut buf.text)
-                        .id(textedit_id)
-                        .font(egui::TextStyle::Monospace)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(20)
-                        .layouter(&mut layouter)
-                        .show(ui);
+    let before = buf.text.clone();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let output = egui::TextEdit::multiline(&mut buf.text)
+                .id(textedit_id)
+                .font(egui::TextStyle::Monospace)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(20)
+                .layouter(&mut layouter)
+                .show(ui);
 
-                    if buf.text != before {
-                        buf.dirty = true;
-                    }
-                    if let Some(range) = output.cursor_range {
-                        let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
-                        let secondary_byte = byte_index_from_char(&buf.text, range.secondary.index);
-                        new_cursor = Some(primary_byte);
-                        new_selection = Some((
-                            primary_byte.min(secondary_byte),
-                            primary_byte.max(secondary_byte),
-                        ));
+            if buf.text != before {
+                buf.dirty = true;
+            }
+            focused = output.response.has_focus();
+            if let Some(range) = output.cursor_range {
+                let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
+                let secondary_byte = byte_index_from_char(&buf.text, range.secondary.index);
+                new_cursor = Some(primary_byte);
+                new_selection = Some((
+                    primary_byte.min(secondary_byte),
+                    primary_byte.max(secondary_byte),
+                ));
 
-                        // Popup anchor: just below the cursor in screen space.
-                        let rect = output.galley.pos_from_cursor(range.primary);
-                        popup_anchor = Some(egui::Pos2 {
-                            x: output.galley_pos.x + rect.min.x,
-                            y: output.galley_pos.y + rect.max.y + 2.0,
-                        });
-                    }
+                // Popup anchor: just below the cursor in screen space.
+                let rect = output.galley.pos_from_cursor(range.primary);
+                popup_anchor = Some(egui::Pos2 {
+                    x: output.galley_pos.x + rect.min.x,
+                    y: output.galley_pos.y + rect.max.y + 2.0,
                 });
+            }
         });
 
-    state.last_cursor = new_cursor;
-    state.last_selection = new_selection;
-
-    // === Post-frame: refresh autocomplete state from the new cursor. ===
-    refresh_autocomplete(state, ctx_in.schema_names, popup_anchor);
-
-    // === Render popup (if any). ===
-    if let Some(ac) = state.autocomplete.as_ref() {
-        render_autocomplete_popup(&egui_ctx, ac);
+    // Keep cursor/selection/autocomplete tied to the focused buffer so
+    // shortcuts and the popup target the right one.
+    if focused {
+        state.active = buf_idx;
+        state.last_cursor = new_cursor;
+        state.last_selection = new_selection;
+        refresh_autocomplete(state, ctx_in.schema_names, popup_anchor);
+        if let Some(ac) = state.autocomplete.as_ref() {
+            render_autocomplete_popup(&egui_ctx, ac);
+        }
+    } else if is_active {
+        // Was the focused buffer last frame, lost focus this frame: drop the
+        // popup so it doesn't linger over an inactive editor.
+        state.autocomplete = None;
     }
 
-    actions
+    focused
 }
 
 fn refresh_autocomplete(
