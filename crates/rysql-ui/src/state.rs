@@ -79,4 +79,10 @@ pub enum PendingExec {
         drop_sql: Option<String>,
         create_sql: String,
     },
+    /// Insert a row into an editable result tab. After execute we re-issue
+    /// the tab's SELECT (offset 0) so auto_increment / default values land.
+    /// The SQL itself lives on the parent `ConfirmAction.sql`.
+    InsertRow {
+        tab_id: u64,
+    },
 }

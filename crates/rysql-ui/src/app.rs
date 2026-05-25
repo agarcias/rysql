@@ -19,7 +19,8 @@ use crate::object_view::{self, ObjectAction, ObjectViewState};
 #[allow(unused_imports)]
 use crate::results::EditRequest;
 use crate::results::{
-    self, EditCellState, EditDialogChoice, ExportFormat, ResultTab, ResultsAction, ResultsState,
+    self, EditCellState, EditDialogChoice, ExportFormat, InsertChoice, InsertRowState, ResultTab,
+    ResultsAction, ResultsState,
 };
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{
@@ -406,6 +407,54 @@ impl RysqlApp {
                         }
                     }
                 }
+                UiEvent::TabColumnsLoaded {
+                    profile,
+                    tab_id,
+                    result,
+                } => {
+                    if !self.is_active_profile(&profile) {
+                        continue;
+                    }
+                    let Some(modal) = self.results.insert_modal.as_mut() else {
+                        continue;
+                    };
+                    if modal.tab_id != tab_id {
+                        continue;
+                    }
+                    match result {
+                        Ok(cols) => modal.seed_values(cols),
+                        Err(e) => modal.columns = LoadState::Error(e),
+                    }
+                }
+                UiEvent::TabRefreshed {
+                    profile,
+                    tab_id,
+                    page_size,
+                    result,
+                } => {
+                    if !self.is_active_profile(&profile) {
+                        continue;
+                    }
+                    let Some(idx) = self.results.find_by_id(tab_id) else {
+                        continue;
+                    };
+                    match result {
+                        Ok(qr) => {
+                            let row_count = qr.rows.len() as u64;
+                            let tab = &mut self.results.tabs[idx];
+                            tab.result = qr;
+                            tab.order = (0..tab.result.rows.len()).collect();
+                            tab.apply_sort();
+                            tab.page_size = page_size;
+                            tab.next_offset = row_count;
+                            tab.has_more = row_count >= page_size && page_size > 0;
+                            self.last_info = Some(format!("Refreshed · {row_count} row(s)"));
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Refresh failed: {e}"));
+                        }
+                    }
+                }
                 UiEvent::CellEdited {
                     profile,
                     tab_id,
@@ -473,7 +522,60 @@ impl RysqlApp {
                     state.source_original.clear();
                 }
             }
+            ExecKind::InsertedRow { tab_id } => {
+                self.refresh_after_row_insert(*tab_id);
+            }
         }
+    }
+
+    /// Pick the right refresh strategy for the tab that just received an
+    /// INSERT: for an Object-view Data subtab we invalidate its `data`
+    /// LoadState (so the next render re-fetches via `load_object_data`);
+    /// for a generic Results tab we re-issue the original SELECT and
+    /// replace rows in place via `UiEvent::TabRefreshed`.
+    fn refresh_after_row_insert(&mut self, tab_id: u64) {
+        let data_subtab_key = self
+            .objects
+            .iter()
+            .find(|(_, state)| state.data_tab_id() == Some(tab_id))
+            .map(|(k, _)| k.clone());
+        if let Some(key) = data_subtab_key {
+            if let Some(state) = self.objects.get_mut(&key) {
+                state.data = LoadState::NotLoaded;
+            }
+            self.results.remove_by_id(tab_id);
+            return;
+        }
+        // Generic Results tab: re-issue tab.sql at offset 0.
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let tab = &self.results.tabs[idx];
+        let sql = tab.sql.clone();
+        let page_size = if tab.page_size == 0 {
+            results::DEFAULT_PAGE_SIZE
+        } else {
+            tab.page_size
+        };
+        let exec_sql = if rysql_sql::has_limit_clause(&sql) {
+            sql.clone()
+        } else {
+            rysql_sql::inject_pagination(&sql, page_size, 0)
+        };
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        self.bridge.spawn(async move {
+            let result = handle.query(exec_sql).await.map_err(|e| e.friendly());
+            UiEvent::TabRefreshed {
+                profile,
+                tab_id,
+                page_size,
+                result,
+            }
+        });
     }
 
     fn run_adhoc(&mut self, sql: String) {
@@ -706,8 +808,40 @@ impl RysqlApp {
                     });
                     self.confirm_typed.clear();
                 }
+                ResultsAction::OpenInsert { tab_id } => self.open_insert_modal(tab_id),
             }
         }
+    }
+
+    /// Open the Insert modal for `tab_id`. Requires the tab to be editable
+    /// (single-table origin). Kicks off `list_columns` so the modal can
+    /// populate; the user sees a spinner until that lands.
+    fn open_insert_modal(&mut self, tab_id: u64) {
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let Some(target) = self.results.tabs[idx].editable.clone() else {
+            self.last_info = Some("Result is not editable (need a single-table origin)".into());
+            return;
+        };
+        self.results.insert_modal = Some(InsertRowState::new(tab_id, target.clone()));
+        let Some(active) = self.active.as_ref() else {
+            self.last_error = Some("Not connected".into());
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        self.bridge.spawn(async move {
+            let result = handle
+                .list_columns(target.db, target.table)
+                .await
+                .map_err(|e| e.friendly());
+            UiEvent::TabColumnsLoaded {
+                profile,
+                tab_id,
+                result,
+            }
+        });
     }
 
     fn collect_schema_names(&self) -> Vec<String> {
@@ -1282,6 +1416,7 @@ impl RysqlApp {
                 ExecKind::AlteredDb(db.clone())
             }
             PendingExec::DropDatabase { .. } => ExecKind::DroppedDatabase,
+            PendingExec::InsertRow { tab_id, .. } => ExecKind::InsertedRow { tab_id: *tab_id },
             PendingExec::EditCell(_) | PendingExec::ReplaceSource { .. } => unreachable!(),
         };
         let sql = action.sql.clone();
@@ -1584,6 +1719,7 @@ impl eframe::App for RysqlApp {
         self.apply_results_actions(&ctx, viewer_actions);
 
         self.render_edit_modal(&ctx);
+        self.render_insert_modal(&ctx);
         self.render_history(&ctx);
     }
 
@@ -1678,6 +1814,35 @@ impl RysqlApp {
                         self.last_error = Some(format!("Cannot build UPDATE: {e}"));
                     }
                 }
+            }
+        }
+    }
+
+    fn render_insert_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.results.insert_modal.take() else {
+            return;
+        };
+        let choice = results::render_insert_modal(ctx, &mut state);
+        match choice {
+            InsertChoice::None => {
+                self.results.insert_modal = Some(state);
+            }
+            InsertChoice::Cancel => {
+                // dropped
+            }
+            InsertChoice::Submit { sql } => {
+                self.confirm = Some(ConfirmAction {
+                    title: format!("Insert into `{}`.`{}`", state.target.db, state.target.table),
+                    message: "Apply this INSERT? The result tab will refresh \
+                              afterwards so server-side defaults / auto_increment \
+                              values are visible."
+                        .into(),
+                    sql,
+                    kind: PendingExec::InsertRow {
+                        tab_id: state.tab_id,
+                    },
+                });
+                self.confirm_typed.clear();
             }
         }
     }

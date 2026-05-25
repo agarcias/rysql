@@ -5,7 +5,9 @@
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use rysql_db::{Cell, ColumnMeta, QueryResult};
+use rysql_db::{Cell, ColumnInfo, ColumnMeta, QueryResult};
+
+use crate::state::LoadState;
 
 pub const DEFAULT_PAGE_SIZE: u64 = 1000;
 
@@ -163,12 +165,71 @@ pub struct EditCellState {
     pub new_value: String,
 }
 
+/// Per-column entry in an [`InsertRowState`]. The user picks one mode and
+/// the SQL builder turns it into a literal in the VALUES list (or omits the
+/// column entirely when set to `Default`).
+#[derive(Debug, Clone)]
+pub enum InsertValue {
+    /// User-typed literal — the builder quotes/escapes based on column type.
+    Text(String),
+    /// Emit `NULL` verbatim.
+    Null,
+    /// Omit this column from the column list (server picks the default /
+    /// auto_increment / generated value).
+    Default,
+}
+
+/// Modal state for the "Insert row" flow opened from an editable result tab.
+/// Columns are loaded lazily via `list_columns`; until they land, `columns`
+/// stays in `Loading` and the modal shows a spinner.
+#[derive(Debug, Clone)]
+pub struct InsertRowState {
+    pub tab_id: u64,
+    pub target: EditableTarget,
+    pub columns: LoadState<Vec<ColumnInfo>>,
+    /// One entry per column once `columns` is `Loaded`. Same indexing.
+    pub values: Vec<InsertValue>,
+}
+
+impl InsertRowState {
+    pub fn new(tab_id: u64, target: EditableTarget) -> Self {
+        Self {
+            tab_id,
+            target,
+            columns: LoadState::Loading,
+            values: Vec::new(),
+        }
+    }
+
+    /// Called by the app once `list_columns` returns. Picks a sensible
+    /// default per column: `Default` for auto_increment / columns with a
+    /// `default_value`, `Null` for nullable columns, otherwise an empty
+    /// `Text`.
+    pub fn seed_values(&mut self, columns: Vec<ColumnInfo>) {
+        self.values = columns.iter().map(suggest_initial_value).collect();
+        self.columns = LoadState::Loaded(columns);
+    }
+}
+
+fn suggest_initial_value(col: &ColumnInfo) -> InsertValue {
+    let has_default =
+        col.default_value.is_some() || col.extra.to_ascii_lowercase().contains("auto_increment");
+    if has_default {
+        InsertValue::Default
+    } else if col.nullable {
+        InsertValue::Null
+    } else {
+        InsertValue::Text(String::new())
+    }
+}
+
 #[derive(Default)]
 pub struct ResultsState {
     pub tabs: Vec<ResultTab>,
     pub tab_seq: u64,
     pub blob_viewer: Option<BlobViewState>,
     pub edit_modal: Option<EditCellState>,
+    pub insert_modal: Option<InsertRowState>,
 }
 
 /// Hard cap on the number of result tabs we keep around simultaneously. The
@@ -238,6 +299,11 @@ pub enum ResultsAction {
         original_value: String,
     },
     ApplyEdit(EditRequest),
+    /// User clicked `+ Add row`. App spawns `list_columns` and opens the
+    /// insert modal once metadata lands.
+    OpenInsert {
+        tab_id: u64,
+    },
 }
 
 /// Render a single result tab's body (footer + grid). The dock owns the tab
@@ -258,6 +324,21 @@ pub fn render_one(
     let tabs = &mut state.tabs;
     let blob_viewer = &mut state.blob_viewer;
     let tab = &mut tabs[idx];
+
+    // Top toolbar: only meaningful when the tab is editable (single-table,
+    // PK detected). Currently hosts the `+ Add row` button; later days add
+    // bulk-action affordances.
+    if tab.editable.is_some() {
+        egui::Panel::top(egui::Id::new(("results-toolbar", tab_id)))
+            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("+ Add row").clicked() {
+                        actions.push(ResultsAction::OpenInsert { tab_id });
+                    }
+                });
+            });
+    }
 
     if tab.has_more {
         egui::Panel::bottom(egui::Id::new(("results-footer", tab_id)))
@@ -776,4 +857,281 @@ pub fn build_update_sql(
         set_value,
         where_parts.join(" AND ")
     ))
+}
+
+// ===== Insert row =====
+
+pub enum InsertChoice {
+    None,
+    Cancel,
+    Submit { sql: String },
+}
+
+/// Build the `INSERT INTO db.tbl (cols) VALUES (literals)` SQL for the given
+/// values. Columns whose value is [`InsertValue::Default`] are omitted from
+/// both lists so the server fills them in.
+pub fn build_insert_sql(
+    target: &EditableTarget,
+    columns: &[ColumnInfo],
+    values: &[InsertValue],
+) -> Result<String, String> {
+    if columns.len() != values.len() {
+        return Err("column/value count mismatch".into());
+    }
+    let mut col_names = Vec::with_capacity(columns.len());
+    let mut literals = Vec::with_capacity(columns.len());
+    for (col, val) in columns.iter().zip(values.iter()) {
+        match val {
+            InsertValue::Default => continue,
+            InsertValue::Null => {
+                col_names.push(format!("`{}`", col.name.replace('`', "``")));
+                literals.push("NULL".to_string());
+            }
+            InsertValue::Text(s) => {
+                col_names.push(format!("`{}`", col.name.replace('`', "``")));
+                literals.push(format_insert_literal(s, &col.data_type));
+            }
+        }
+    }
+    let db = target.db.replace('`', "``");
+    let table = target.table.replace('`', "``");
+    if col_names.is_empty() {
+        // All columns left as DEFAULT: use the MySQL empty-row form.
+        return Ok(format!("INSERT INTO `{db}`.`{table}` () VALUES ()"));
+    }
+    Ok(format!(
+        "INSERT INTO `{}`.`{}` ({}) VALUES ({})",
+        db,
+        table,
+        col_names.join(", "),
+        literals.join(", ")
+    ))
+}
+
+fn is_numeric_data_type(data_type: &str) -> bool {
+    let lower = data_type.trim().to_ascii_lowercase();
+    for prefix in [
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "bigint",
+        "int",
+        "decimal",
+        "numeric",
+        "float",
+        "double",
+        "real",
+        "bit",
+    ] {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_insert_literal(value: &str, data_type: &str) -> String {
+    if is_numeric_data_type(data_type) && !value.is_empty() {
+        // Ship the user-typed numeric verbatim; the server will reject
+        // malformed input with a friendly error.
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    }
+}
+
+pub fn render_insert_modal(ctx: &egui::Context, state: &mut InsertRowState) -> InsertChoice {
+    let mut choice = InsertChoice::None;
+    egui::Modal::new(egui::Id::new("insert-row-modal")).show(ctx, |ui| {
+        ui.set_min_width(820.0);
+        ui.heading(format!(
+            "Insert into `{}`.`{}`",
+            state.target.db, state.target.table
+        ));
+        ui.label(
+            egui::RichText::new("Columns set to DEFAULT or auto_increment are left to the server.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(10.0);
+
+        match &state.columns {
+            LoadState::NotLoaded | LoadState::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading columns…");
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        choice = InsertChoice::Cancel;
+                    }
+                });
+                return;
+            }
+            LoadState::Error(e) => {
+                ui.colored_label(egui::Color32::from_rgb(0xe5, 0x73, 0x73), e);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        choice = InsertChoice::Cancel;
+                    }
+                });
+                return;
+            }
+            LoadState::Loaded(_) => {}
+        };
+
+        // Borrow `columns` once for the row layout; `values` is mutated by
+        // index so we don't need a separate handle.
+        let cols_clone: Vec<ColumnInfo> = match &state.columns {
+            LoadState::Loaded(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("insert-modal-scroll")
+            .max_height(480.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let last = cols_clone.len().saturating_sub(1);
+                for (i, col) in cols_clone.iter().enumerate() {
+                    render_insert_row(ui, i, col, &mut state.values[i]);
+                    if i != last {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
+                }
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                choice = InsertChoice::Cancel;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let cols = match &state.columns {
+                    LoadState::Loaded(c) => c.as_slice(),
+                    _ => &[],
+                };
+                let preview = build_insert_sql(&state.target, cols, &state.values);
+                let enabled = preview.is_ok();
+                let btn = egui::Button::new("Insert…");
+                if ui.add_enabled(enabled, btn).clicked() {
+                    if let Ok(sql) = preview {
+                        choice = InsertChoice::Submit { sql };
+                    }
+                }
+            });
+        });
+    });
+    choice
+}
+
+/// Single column block inside the Insert modal. Layout: top row has the
+/// label (name + type / badges) on the left and the Value/NULL/DEFAULT
+/// radios pinned to the right; bottom row is the value input that spans
+/// the full modal width.
+fn render_insert_row(ui: &mut egui::Ui, row_idx: usize, col: &ColumnInfo, value: &mut InsertValue) {
+    ui.horizontal(|ui| {
+        // Label cell: name on top line, type + badges on the muted second line.
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(&col.name).strong());
+            ui.label(
+                egui::RichText::new(badge_line(col))
+                    .weak()
+                    .small()
+                    .monospace(),
+            );
+        });
+
+        // Radios pinned to the right of the row, horizontal so the labels
+        // stay on one line. The right-to-left layout reverses click order,
+        // so we add Value last so it appears leftmost (visual reading order).
+        let mut mode = mode_of(value);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.radio_value(&mut mode, InsertMode::Default, "DEFAULT");
+            ui.add_space(4.0);
+            ui.radio_value(&mut mode, InsertMode::Null, "NULL");
+            ui.add_space(4.0);
+            ui.radio_value(&mut mode, InsertMode::Value, "Value");
+        });
+        set_mode(value, mode);
+    });
+
+    // Input on its own row, full width. Non-interactive placeholder when the
+    // mode isn't Value so the user can still see which column they're on
+    // without the input collapsing.
+    let id_salt = ("insert-modal-input", row_idx);
+    match value {
+        InsertValue::Text(s) => {
+            ui.add(
+                egui::TextEdit::singleline(s)
+                    .id_salt(id_salt)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        }
+        InsertValue::Null => {
+            let mut placeholder = String::from("NULL");
+            ui.add(
+                egui::TextEdit::singleline(&mut placeholder)
+                    .id_salt(id_salt)
+                    .interactive(false)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        }
+        InsertValue::Default => {
+            let mut placeholder = String::from("(server default)");
+            ui.add(
+                egui::TextEdit::singleline(&mut placeholder)
+                    .id_salt(id_salt)
+                    .interactive(false)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        }
+    }
+}
+
+fn badge_line(col: &ColumnInfo) -> String {
+    let mut hints = vec![col.data_type.clone()];
+    if col.is_pk {
+        hints.push("PK".to_string());
+    }
+    if !col.nullable {
+        hints.push("NOT NULL".to_string());
+    }
+    if !col.extra.is_empty() {
+        hints.push(col.extra.clone());
+    }
+    hints.join(" · ")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InsertMode {
+    Value,
+    Null,
+    Default,
+}
+
+fn mode_of(v: &InsertValue) -> InsertMode {
+    match v {
+        InsertValue::Text(_) => InsertMode::Value,
+        InsertValue::Null => InsertMode::Null,
+        InsertValue::Default => InsertMode::Default,
+    }
+}
+
+fn set_mode(v: &mut InsertValue, mode: InsertMode) {
+    match (&v, mode) {
+        (InsertValue::Text(_), InsertMode::Value)
+        | (InsertValue::Null, InsertMode::Null)
+        | (InsertValue::Default, InsertMode::Default) => {}
+        (_, InsertMode::Value) => *v = InsertValue::Text(String::new()),
+        (_, InsertMode::Null) => *v = InsertValue::Null,
+        (_, InsertMode::Default) => *v = InsertValue::Default,
+    }
 }

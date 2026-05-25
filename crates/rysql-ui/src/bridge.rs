@@ -110,6 +110,24 @@ pub enum UiEvent {
         page_size: u64,
         result: Result<QueryResult, String>,
     },
+    /// Column metadata loaded specifically for an Insert modal targeting
+    /// a Results tab. Keyed by `tab_id` so the modal can match the response
+    /// to its open instance.
+    TabColumnsLoaded {
+        profile: String,
+        tab_id: u64,
+        result: Result<Vec<ColumnInfo>, String>,
+    },
+    /// Result of re-issuing a Results tab's original SELECT (offset 0) to
+    /// pick up server-side changes (auto_increment values, default values,
+    /// rows added by other clients). The handler replaces the tab's rows
+    /// in place.
+    TabRefreshed {
+        profile: String,
+        tab_id: u64,
+        page_size: u64,
+        result: Result<QueryResult, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +142,10 @@ pub enum ExecKind {
     /// Source `LoadState` so the next render re-runs `SHOW CREATE` and clear
     /// the edit-mode flag on the matching `ObjectViewState`.
     ReplaceSource(ObjectKey),
+    /// A row was inserted into the result tab with this id. The handler
+    /// refreshes the tab (or its backing Object data subtab) so server-side
+    /// changes (auto_increment, defaults) become visible.
+    InsertedRow { tab_id: u64 },
 }
 
 pub struct Bridge {

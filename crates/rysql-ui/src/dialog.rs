@@ -278,6 +278,9 @@ fn confirm_target(action: &ConfirmAction) -> Option<String> {
         // user is about to submit is already visible in the SQL preview; a
         // type-to-confirm gate on top of that is overkill.
         PendingExec::ReplaceSource { .. } => None,
+        // INSERT is non-destructive (it only adds a row); same reasoning —
+        // the SQL preview is already in front of the user.
+        PendingExec::InsertRow { .. } => None,
     }
 }
 
@@ -289,5 +292,6 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::DropDatabase { .. } => "database",
         PendingExec::EditCell(_) => "cell",
         PendingExec::ReplaceSource { .. } => "routine",
+        PendingExec::InsertRow { .. } => "row",
     }
 }
