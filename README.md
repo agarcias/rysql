@@ -35,6 +35,21 @@ A desktop GUI client for **MySQL** and **MariaDB**, written in Rust.
   *Data* (first 1000 rows, sort + edit + fetch-next) and *Source*
   (`SHOW CREATE …` with syntax highlight). Re-opening focuses the
   existing tab.
+- **Editing schema and data** — work without leaving the inspector:
+  - *Source* gains Edit / Save / Revert for procedures, functions and
+    views — the body is sent through DROP + CREATE in a single
+    routine-replace command, bypassing the client-side statement
+    splitter (so `;` inside `BEGIN…END` survives).
+  - *Structure* exposes `+ Add column`, per-row `Edit` / `Drop`
+    buttons; the modal builds `ALTER TABLE … ADD/CHANGE/DROP COLUMN`
+    SQL with a live preview. DROP COLUMN requires typing the column
+    name; ADD/MODIFY use the preview as their gate.
+  - *Data* and any editable Results tab gain `+ Add row`, a per-row
+    checkbox column, right-click `Delete row…`, and toolbar actions
+    for `Delete N rows…` and `Bulk edit column…` (single UPDATE
+    across the selected rows). The Insert modal loads column
+    metadata lazily so each NOT NULL / DEFAULT / auto_increment hint
+    is correct.
 - **UX** — friendly MySQL error messages (1062, 1146, 1213, …),
   searchable persistent history, query cancel button while running,
   light / dark / system theme, rotated logs and a panic-to-crashlog hook.

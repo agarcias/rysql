@@ -1,11 +1,10 @@
-//! Modal for adding (and later modifying) a column on a table. The state
-//! is kept on `RysqlApp::column_edit_modal`; [`render_column_edit_modal`]
-//! drives the per-frame rendering and returns a [`ColumnEditChoice`] for
-//! the caller to act on.
-//!
-//! Day 5 scope: `ColumnEditMode::Add`. Day 6 will extend with `Modify`.
+//! Modal for adding or modifying a column on a table. The state is kept
+//! on `RysqlApp::column_edit_modal`; [`render_column_edit_modal`] drives
+//! the per-frame rendering and returns a [`ColumnEditChoice`] for the
+//! caller to act on.
 
 use eframe::egui;
+use rysql_db::ColumnInfo;
 
 use crate::state::ObjectKey;
 
@@ -13,6 +12,10 @@ use crate::state::ObjectKey;
 pub enum ColumnEditMode {
     /// `ALTER TABLE … ADD COLUMN …`.
     Add,
+    /// `ALTER TABLE … CHANGE COLUMN \`<old_name>\` \`<new_name>\` …`. We
+    /// always emit `CHANGE` (not `MODIFY`) so the same builder covers both
+    /// "rename + retype" and "retype-only".
+    Modify { old_name: String },
 }
 
 /// How the user wants the column's `DEFAULT` to be emitted in the ALTER
@@ -55,6 +58,31 @@ impl ColumnEditState {
             comment: String::new(),
         }
     }
+
+    /// Prefill the modal with the current properties of `col`. The `old`
+    /// name is captured so the builder emits `CHANGE COLUMN \`old\` …` and
+    /// allows the user to rename the column.
+    pub fn new_modify(key: ObjectKey, col: &ColumnInfo) -> Self {
+        let (default_mode, default_value) = match col.default_value.as_deref() {
+            None => (ColumnDefault::None, String::new()),
+            Some(v) if v.eq_ignore_ascii_case("NULL") => (ColumnDefault::Null, String::new()),
+            Some(v) => (ColumnDefault::Value, v.to_string()),
+        };
+        let auto_increment = col.extra.to_ascii_lowercase().contains("auto_increment");
+        Self {
+            key,
+            mode: ColumnEditMode::Modify {
+                old_name: col.name.clone(),
+            },
+            name: col.name.clone(),
+            data_type: col.data_type.clone(),
+            nullable: col.nullable,
+            default_mode,
+            default_value,
+            auto_increment,
+            comment: col.comment.clone(),
+        }
+    }
 }
 
 pub enum ColumnEditChoice {
@@ -63,9 +91,9 @@ pub enum ColumnEditChoice {
     Submit { sql: String },
 }
 
-/// Build the `ALTER TABLE … ADD COLUMN …` SQL for the current state. The
-/// caller is responsible for pushing it through the confirm modal.
-pub fn build_add_column_sql(state: &ColumnEditState) -> Result<String, String> {
+/// Build the `ALTER TABLE …` SQL for the current state. Dispatches on
+/// `state.mode` so the same form covers both ADD COLUMN and CHANGE COLUMN.
+pub fn build_column_sql(state: &ColumnEditState) -> Result<String, String> {
     let name = state.name.trim();
     let data_type = state.data_type.trim();
     if name.is_empty() {
@@ -78,21 +106,38 @@ pub fn build_add_column_sql(state: &ColumnEditState) -> Result<String, String> {
     let db = state.key.db.replace('`', "``");
     let table = state.key.name.replace('`', "``");
     let col = name.replace('`', "``");
+    let clause = build_column_clause(state, data_type);
 
-    let mut sql = format!("ALTER TABLE `{db}`.`{table}` ADD COLUMN `{col}` {data_type}");
-    sql.push_str(if state.nullable { " NULL" } else { " NOT NULL" });
+    let sql = match &state.mode {
+        ColumnEditMode::Add => {
+            format!("ALTER TABLE `{db}`.`{table}` ADD COLUMN `{col}` {clause}")
+        }
+        ColumnEditMode::Modify { old_name } => {
+            let old = old_name.replace('`', "``");
+            format!("ALTER TABLE `{db}`.`{table}` CHANGE COLUMN `{old}` `{col}` {clause}")
+        }
+    };
+    Ok(sql)
+}
+
+/// Shared body of an `ADD COLUMN` / `CHANGE COLUMN` clause: type + NULL +
+/// DEFAULT / AUTO_INCREMENT + COMMENT. Doesn't include the column name —
+/// that's emitted differently per mode.
+fn build_column_clause(state: &ColumnEditState, data_type: &str) -> String {
+    let mut clause = data_type.to_string();
+    clause.push_str(if state.nullable { " NULL" } else { " NOT NULL" });
 
     // DEFAULT and AUTO_INCREMENT are conceptually mutually exclusive:
     // AUTO_INCREMENT is its own server-managed default. If the user ticked
     // both, AUTO_INCREMENT wins.
     if state.auto_increment {
-        sql.push_str(" AUTO_INCREMENT");
+        clause.push_str(" AUTO_INCREMENT");
     } else {
         match state.default_mode {
             ColumnDefault::None => {}
             ColumnDefault::Null => {
                 if state.nullable {
-                    sql.push_str(" DEFAULT NULL");
+                    clause.push_str(" DEFAULT NULL");
                 }
             }
             ColumnDefault::Value => {
@@ -100,7 +145,7 @@ pub fn build_add_column_sql(state: &ColumnEditState) -> Result<String, String> {
                     .default_value
                     .replace('\\', "\\\\")
                     .replace('\'', "''");
-                sql.push_str(&format!(" DEFAULT '{escaped}'"));
+                clause.push_str(&format!(" DEFAULT '{escaped}'"));
             }
         }
     }
@@ -108,10 +153,10 @@ pub fn build_add_column_sql(state: &ColumnEditState) -> Result<String, String> {
     let comment = state.comment.trim();
     if !comment.is_empty() {
         let escaped = comment.replace('\\', "\\\\").replace('\'', "''");
-        sql.push_str(&format!(" COMMENT '{escaped}'"));
+        clause.push_str(&format!(" COMMENT '{escaped}'"));
     }
 
-    Ok(sql)
+    clause
 }
 
 /// Build the `ALTER TABLE … DROP COLUMN …` SQL for the given column.
@@ -129,8 +174,12 @@ pub fn render_column_edit_modal(
     state: &mut ColumnEditState,
 ) -> ColumnEditChoice {
     let mut choice = ColumnEditChoice::None;
-    let title = match state.mode {
+    let title = match &state.mode {
         ColumnEditMode::Add => format!("Add column to `{}`.`{}`", state.key.db, state.key.name),
+        ColumnEditMode::Modify { old_name } => format!(
+            "Modify column `{old_name}` of `{}`.`{}`",
+            state.key.db, state.key.name
+        ),
     };
     egui::Modal::new(egui::Id::new("column-edit-modal")).show(ctx, |ui| {
         ui.set_min_width(720.0);
@@ -203,7 +252,7 @@ pub fn render_column_edit_modal(
 
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Preview SQL").weak().small());
-        let preview = build_add_column_sql(state);
+        let preview = build_column_sql(state);
         let mut preview_text = match &preview {
             Ok(s) => s.clone(),
             Err(e) => format!("({e})"),
@@ -232,6 +281,7 @@ pub fn render_column_edit_modal(
                 let enabled = preview.is_ok();
                 let label = match state.mode {
                     ColumnEditMode::Add => "Add…",
+                    ColumnEditMode::Modify { .. } => "Apply…",
                 };
                 let btn = egui::Button::new(label);
                 if ui.add_enabled(enabled, btn).clicked() {

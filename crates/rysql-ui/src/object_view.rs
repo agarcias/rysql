@@ -71,9 +71,10 @@ impl ObjectViewState {
     }
 }
 
-/// Object kinds whose Source can be re-created in place via DROP + CREATE
-/// (or `CREATE OR REPLACE`). Tables are excluded — they go through the
-/// Structure subtab's column editor in a later iteration.
+/// Object kinds whose Source can be re-created in place via DROP + CREATE.
+/// Tables go through the Structure subtab's per-column editor instead;
+/// triggers and events are not supported yet (they require re-binding to
+/// their host table or event scheduler).
 pub fn supports_source_editing(kind: ObjectKind) -> bool {
     matches!(
         kind,
@@ -100,6 +101,12 @@ pub enum ObjectAction {
     /// User clicked `[Drop]` on a column row. The app builds the DROP SQL
     /// and pushes the destructive-confirm modal.
     DropColumn {
+        name: String,
+    },
+    /// User clicked `[Edit]` on a column row. The app looks up the column
+    /// in `state.columns` and opens the modal in Modify mode prefilled
+    /// with the current values.
+    ModifyColumn {
         name: String,
     },
 }
@@ -283,6 +290,7 @@ fn render_columns(
         LoadState::Loaded(cols) => {
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
             let mut drop_request: Option<String> = None;
+            let mut edit_request: Option<String> = None;
             let mut builder = TableBuilder::new(ui)
                 .id_salt(("obj-cols",))
                 .striped(true)
@@ -296,7 +304,7 @@ fn render_columns(
                 .column(Column::initial(180.0).at_least(40.0).resizable(true)) // extra
                 .column(Column::initial(160.0).at_least(60.0).resizable(true)); // comment
             if editable {
-                builder = builder.column(Column::exact(70.0)); // actions
+                builder = builder.column(Column::exact(120.0)); // actions
             } else {
                 builder = builder.column(Column::remainder().at_least(80.0));
             }
@@ -347,20 +355,35 @@ fn render_columns(
                         });
                         if editable {
                             row.col(|ui| {
-                                let btn = egui::Button::new(
-                                    egui::RichText::new("Drop")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
-                                );
-                                if ui.add(btn).on_hover_text("Drop this column").clicked() {
-                                    drop_request = Some(c.name.clone());
-                                }
+                                ui.horizontal(|ui| {
+                                    let edit_btn =
+                                        egui::Button::new(egui::RichText::new("Edit").small());
+                                    if ui
+                                        .add(edit_btn)
+                                        .on_hover_text("Modify this column")
+                                        .clicked()
+                                    {
+                                        edit_request = Some(c.name.clone());
+                                    }
+                                    let drop_btn = egui::Button::new(
+                                        egui::RichText::new("Drop")
+                                            .small()
+                                            .color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
+                                    );
+                                    if ui.add(drop_btn).on_hover_text("Drop this column").clicked()
+                                    {
+                                        drop_request = Some(c.name.clone());
+                                    }
+                                });
                             });
                         } else {
                             row.col(|_ui| {});
                         }
                     });
                 });
+            if let Some(name) = edit_request {
+                actions.push(ObjectAction::ModifyColumn { name });
+            }
             if let Some(name) = drop_request {
                 actions.push(ObjectAction::DropColumn { name });
             }

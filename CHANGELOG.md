@@ -6,6 +6,49 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added — Editable Object inspector + editable Results tabs
+- *Source* of procedures, functions and views is editable in place
+  (`Edit` / `Save` / `Revert`). Save goes through a new
+  `DbHandle::replace_routine` actor command that runs an optional
+  `DROP` followed by the user's CREATE body as a single
+  `sqlx::query`, bypassing the client-side statement splitter so
+  semicolons inside `BEGIN … END` survive. DDL is not transactional
+  in MySQL/MariaDB — if the CREATE fails after a successful DROP,
+  the routine stays dropped until the user re-saves, and the
+  confirm modal calls that out before the user commits.
+- Results tabs that originate from a single table gain a row-edit
+  toolkit:
+  - `+ Add row` opens a per-column Insert modal with NULL / DEFAULT
+    radios, lazy-loaded column metadata, and a live SQL preview.
+  - A leading checkbox column lets the user select rows; right-click
+    on a cell exposes `Delete row…`. Bulk actions appear in the
+    toolbar — `Delete N row(s)…` (single-PK `IN (…)` or
+    composite-PK tuple form) and, with ≥ 2 rows selected,
+    `Bulk edit column…` for a single UPDATE across the selection.
+  - Successful INSERT refreshes the result tab (Data subtab via
+    LoadState invalidation; generic tabs via re-issuing the
+    original SELECT and replacing rows in place); DELETE and bulk
+    UPDATE patch the local grid in place to preserve pagination.
+- *Structure* of tables exposes `+ Add column` and per-row `Edit`
+  and `Drop` buttons. The modal handles both ADD COLUMN and
+  CHANGE COLUMN (Modify mode is prefilled with the current
+  properties) and emits a single ALTER TABLE; the dialog shows a
+  live SQL preview. DROP COLUMN reuses the type-to-confirm gate so
+  the user has to type the column name. After every column ALTER
+  the Object view invalidates columns / indexes / foreign_keys /
+  data so the next render re-fetches.
+- Bridge-side plumbing: `UiEvent::TabColumnsLoaded` and
+  `UiEvent::TabRefreshed`; new `ExecKind::{InsertedRow,
+  DeletedRows, BulkUpdated, ReplaceSource, AlteredColumns}` plus
+  matching `PendingExec` variants that route through the existing
+  destructive-confirm modal. `DbCommand::ReplaceRoutine` and
+  `DbHandle::replace_routine` added to `rysql-db`.
+- New modules `column_dialog` (Add / Modify column form) on the UI
+  side. The Insert / Bulk Update / Column edit modals all share the
+  pattern of building the SQL during render, gating Submit on it,
+  and surfacing it as the destructive-confirm preview so the user
+  always sees the exact statement before clicking through.
+
 ### Added — Dock layout (editor + results + object inspector)
 - Central panel migrated to `egui_dock` 0.19. Editor buffers, result sets
   and object inspectors now live as draggable tabs in a single dock area;

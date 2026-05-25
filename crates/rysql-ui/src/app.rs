@@ -11,7 +11,7 @@ use rysql_sql::Highlighter;
 use tokio::task::AbortHandle;
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
-use crate::column_dialog::{self, ColumnEditChoice, ColumnEditState};
+use crate::column_dialog::{self, ColumnEditChoice, ColumnEditMode, ColumnEditState};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
@@ -1197,7 +1197,8 @@ impl RysqlApp {
                     ObjectAction::LoadData => state.data = LoadState::Error(msg),
                     ObjectAction::SaveSource(_)
                     | ObjectAction::AddColumn
-                    | ObjectAction::DropColumn { .. } => self.last_error = Some(msg),
+                    | ObjectAction::DropColumn { .. }
+                    | ObjectAction::ModifyColumn { .. } => self.last_error = Some(msg),
                 }
             }
             return;
@@ -1271,7 +1272,28 @@ impl RysqlApp {
                 self.column_edit_modal = Some(ColumnEditState::new_add(key));
             }
             ObjectAction::DropColumn { name } => self.enqueue_drop_column(key, name),
+            ObjectAction::ModifyColumn { name } => self.open_modify_column(key, name),
         }
+    }
+
+    /// Look up `name` in the Object view's cached columns and open the
+    /// edit modal in Modify mode, prefilled with the current properties.
+    /// Bails with a friendly message if the columns haven't loaded yet
+    /// (which shouldn't happen — the user can only click the button when
+    /// the row is visible).
+    fn open_modify_column(&mut self, key: ObjectKey, name: String) {
+        let Some(state) = self.objects.get(&key) else {
+            return;
+        };
+        let LoadState::Loaded(cols) = &state.columns else {
+            self.last_info = Some("Columns haven't loaded yet".into());
+            return;
+        };
+        let Some(col) = cols.iter().find(|c| c.name == name) else {
+            self.last_info = Some(format!("Column `{name}` is no longer present"));
+            return;
+        };
+        self.column_edit_modal = Some(ColumnEditState::new_modify(key, col));
     }
 
     /// Build `ALTER TABLE … DROP COLUMN …` and route through the
@@ -2144,13 +2166,20 @@ impl RysqlApp {
                 // dropped
             }
             ColumnEditChoice::Submit { sql } => {
-                self.confirm = Some(ConfirmAction {
-                    title: format!(
+                let title = match &state.mode {
+                    ColumnEditMode::Add => format!(
                         "Add column `{}` to `{}`.`{}`",
                         state.name.trim(),
                         state.key.db,
                         state.key.name
                     ),
+                    ColumnEditMode::Modify { old_name } => format!(
+                        "Modify column `{old_name}` of `{}`.`{}`",
+                        state.key.db, state.key.name,
+                    ),
+                };
+                self.confirm = Some(ConfirmAction {
+                    title,
                     message: "Apply this ALTER TABLE? The Structure subtab \
                               and any open Data subtab will refresh on success."
                         .into(),
