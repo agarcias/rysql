@@ -6,6 +6,7 @@ mod bridge;
 mod dialog;
 mod editor;
 mod fonts;
+mod results;
 mod runtime;
 mod sidebar;
 mod state;

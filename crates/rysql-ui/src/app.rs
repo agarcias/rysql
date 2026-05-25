@@ -7,6 +7,7 @@ use rysql_db::{build_pool, test_connection, DbActor, ObjectKind};
 use crate::bridge::{Bridge, ExecKind, UiEvent};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::editor::{self, EditorAction, EditorState};
+use crate::results::{self, ResultTab, ResultsAction, ResultsState};
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{ActiveConnection, ConfirmAction, LoadState, PendingExec, SchemaState};
 
@@ -22,6 +23,7 @@ pub struct RysqlApp {
     confirm: Option<ConfirmAction>,
     confirm_typed: String,
     editor: EditorState,
+    results: ResultsState,
 }
 
 impl RysqlApp {
@@ -51,6 +53,7 @@ impl RysqlApp {
             confirm: None,
             confirm_typed: String::new(),
             editor: EditorState::default(),
+            results: ResultsState::default(),
         }
     }
 
@@ -156,6 +159,30 @@ impl RysqlApp {
                         }
                     }
                 }
+                UiEvent::QueryResult {
+                    profile,
+                    label,
+                    result,
+                } => {
+                    if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
+                        continue;
+                    }
+                    match result {
+                        Ok(qr) => {
+                            self.last_error = None;
+                            self.last_info = Some(format!(
+                                "{} row(s) · {} col(s) · {:.1?}",
+                                qr.rows.len(),
+                                qr.columns.len(),
+                                qr.elapsed
+                            ));
+                            self.results.push(ResultTab::new(label, qr));
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Query failed: {e}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -184,14 +211,43 @@ impl RysqlApp {
         };
         let profile = active.profile_name.clone();
         let handle = active.handle.clone();
-        self.bridge.spawn(async move {
-            let result = handle.execute(sql).await.map_err(|e| e.to_string());
-            UiEvent::ExecResult {
-                profile,
-                kind: ExecKind::Adhoc,
-                result,
+        let label = sql_label(&sql);
+        if rysql_sql::is_query_returning_rows(&sql) {
+            self.bridge.spawn(async move {
+                let result = handle.query(sql).await.map_err(|e| e.to_string());
+                UiEvent::QueryResult {
+                    profile,
+                    label,
+                    result,
+                }
+            });
+        } else {
+            self.bridge.spawn(async move {
+                let result = handle.execute(sql).await.map_err(|e| e.to_string());
+                UiEvent::ExecResult {
+                    profile,
+                    kind: ExecKind::Adhoc,
+                    result,
+                }
+            });
+        }
+    }
+
+    fn apply_results_actions(&mut self, ctx: &egui::Context, actions: Vec<ResultsAction>) {
+        for action in actions {
+            match action {
+                ResultsAction::SelectTab(i) => {
+                    if i < self.results.tabs.len() {
+                        self.results.active = i;
+                    }
+                }
+                ResultsAction::CloseTab(i) => self.results.close(i),
+                ResultsAction::CopyText(text) => {
+                    ctx.copy_text(text.clone());
+                    self.last_info = Some(format!("Copied: {text}"));
+                }
             }
-        });
+        }
     }
 
     fn collect_schema_names(&self) -> Vec<String> {
@@ -579,6 +635,15 @@ impl RysqlApp {
     }
 }
 
+fn sql_label(sql: &str) -> String {
+    let one_line: String = sql.split('\n').next().unwrap_or("").trim().to_string();
+    if one_line.len() <= 48 {
+        one_line
+    } else {
+        format!("{}…", &one_line.chars().take(47).collect::<String>())
+    }
+}
+
 impl eframe::App for RysqlApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -603,6 +668,18 @@ impl eframe::App for RysqlApp {
 
         let shortcut_actions =
             editor::handle_shortcuts(&ctx, self.confirm.is_none() && self.dialog.is_none());
+
+        let mut results_actions = Vec::new();
+        if !self.results.is_empty() {
+            egui::Panel::bottom("results-pane")
+                .resizable(true)
+                .default_size(320.0)
+                .min_size(140.0)
+                .show_inside(ui, |ui| {
+                    results_actions = results::render(ui, &mut self.results);
+                });
+        }
+        self.apply_results_actions(&ctx, results_actions);
 
         let schema_names = self.collect_schema_names();
         let mut editor_actions = Vec::new();

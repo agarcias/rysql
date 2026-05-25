@@ -313,6 +313,8 @@ fn render_category(
                 let resp = ui.add(
                     egui::Label::new(format!("{}  {}", kind.short_label(), name))
                         .selectable(false)
+                        .truncate()
+                        .show_tooltip_when_elided(true)
                         .sense(egui::Sense::click()),
                 );
                 resp.context_menu(|ui| {

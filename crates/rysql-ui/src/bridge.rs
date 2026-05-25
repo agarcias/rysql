@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use eframe::egui;
-use rysql_db::{DbHandle, ExecOutcome, SchemaObjects, ServerInfo};
+use rysql_db::{DbHandle, ExecOutcome, QueryResult, SchemaObjects, ServerInfo};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -40,6 +40,11 @@ pub enum UiEvent {
         profile: String,
         kind: ExecKind,
         result: Result<ExecOutcome, String>,
+    },
+    QueryResult {
+        profile: String,
+        label: String,
+        result: Result<QueryResult, String>,
     },
 }
 

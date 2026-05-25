@@ -7,6 +7,7 @@ use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::query::{self, QueryResult};
 use crate::schema::{self, ObjectKind, SchemaObjects};
 
 #[derive(Debug, Error)]
@@ -53,6 +54,10 @@ enum DbCommand {
     Execute {
         sql: String,
         reply: Reply<ExecOutcome>,
+    },
+    Query {
+        sql: String,
+        reply: Reply<QueryResult>,
     },
     Shutdown,
 }
@@ -110,6 +115,10 @@ impl DbHandle {
             .await
     }
 
+    pub async fn query(&self, sql: String) -> Result<QueryResult, ActorError> {
+        self.request(|reply| DbCommand::Query { sql, reply }).await
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(DbCommand::Shutdown);
     }
@@ -154,6 +163,9 @@ impl DbActor {
                 }
                 DbCommand::Execute { sql, reply } => {
                     let _ = reply.send(execute(&self.pool, &sql).await);
+                }
+                DbCommand::Query { sql, reply } => {
+                    let _ = reply.send(query::run_query(&self.pool, &sql).await);
                 }
                 DbCommand::Shutdown => break,
             }
