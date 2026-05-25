@@ -221,14 +221,19 @@ pub fn show_confirm(
         );
         ui.add_space(8.0);
 
-        let target = confirm_target(action);
-        ui.label(format!(
-            "Type the {} name to confirm:",
-            confirm_target_label(action)
-        ));
-        ui.label(egui::RichText::new(&target).strong().monospace());
-        ui.add(egui::TextEdit::singleline(typed).desired_width(f32::INFINITY));
-        ui.add_space(8.0);
+        let enabled = match confirm_target(action) {
+            Some(target) => {
+                ui.label(format!(
+                    "Type the {} name to confirm:",
+                    confirm_target_label(action)
+                ));
+                ui.label(egui::RichText::new(&target).strong().monospace());
+                ui.add(egui::TextEdit::singleline(typed).desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                typed.trim() == target
+            }
+            None => true,
+        };
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -236,7 +241,6 @@ pub fn show_confirm(
                 choice = ConfirmChoice::Cancel;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = typed.trim() == target;
                 let btn = egui::Button::new(
                     egui::RichText::new("Confirm").color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
                 );
@@ -249,12 +253,15 @@ pub fn show_confirm(
     choice
 }
 
-fn confirm_target(action: &ConfirmAction) -> String {
+/// `Some(target)` when the user must type the target name to confirm; `None`
+/// when a plain Confirm button suffices (non-destructive edits).
+fn confirm_target(action: &ConfirmAction) -> Option<String> {
     use crate::state::PendingExec;
     match &action.kind {
-        PendingExec::DropObject { name, .. } => name.clone(),
-        PendingExec::Truncate { name, .. } => name.clone(),
-        PendingExec::DropDatabase { db } => db.clone(),
+        PendingExec::DropObject { name, .. } => Some(name.clone()),
+        PendingExec::Truncate { name, .. } => Some(name.clone()),
+        PendingExec::DropDatabase { db } => Some(db.clone()),
+        PendingExec::EditCell(_) => None,
     }
 }
 
@@ -264,5 +271,6 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::DropObject { .. } => "object",
         PendingExec::Truncate { .. } => "table",
         PendingExec::DropDatabase { .. } => "database",
+        PendingExec::EditCell(_) => "cell",
     }
 }

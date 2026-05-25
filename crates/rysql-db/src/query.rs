@@ -3,14 +3,21 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sqlx::{AssertSqlSafe, Column, Row, TypeInfo};
+use sqlx::{AssertSqlSafe, Column, ColumnOrigin, Row, TypeInfo};
 
 use crate::actor::ActorError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnMeta {
+    /// Name as it appears in the result set (alias if `SELECT a AS b`).
     pub name: String,
     pub type_name: String,
+    /// `(database, table)` when sqlx attributes the column to a source table.
+    /// The driver returns the table qualified as `"db.table"` when both are
+    /// known; we split it back into a pair.
+    pub origin: Option<(String, String)>,
+    /// Original column name in the source table (when [`Self::origin`] is set).
+    pub original_name: Option<String>,
 }
 
 /// A scalar cell value, decoded from the wire to a UI-friendly representation.
@@ -22,9 +29,9 @@ pub enum Cell {
     Float(f64),
     Bool(bool),
     Text(String),
-    /// Binary blob — stored as length only for the grid; raw bytes elided.
-    Blob(usize),
-    /// JSON value formatted as a string.
+    /// Binary blob with full bytes retained; pagination bounds memory.
+    Blob(Vec<u8>),
+    /// JSON value formatted as a string (pretty-printed if valid).
     Json(String),
 }
 
@@ -38,7 +45,7 @@ impl Cell {
             Cell::Float(v) => format!("{v}"),
             Cell::Bool(v) => (if *v { "1" } else { "0" }).into(),
             Cell::Text(s) => s.clone(),
-            Cell::Blob(n) => format!("<BLOB {n} bytes>"),
+            Cell::Blob(b) => format!("<BLOB {} bytes>", b.len()),
             Cell::Json(s) => s.clone(),
         }
     }
@@ -65,9 +72,25 @@ pub async fn run_query(pool: &sqlx::MySqlPool, sql: &str) -> Result<QueryResult,
         first
             .columns()
             .iter()
-            .map(|c| ColumnMeta {
-                name: c.name().to_string(),
-                type_name: c.type_info().name().to_string(),
+            .map(|c| {
+                let (origin, original_name) = match c.origin() {
+                    ColumnOrigin::Table(tc) => {
+                        let table_str: &str = &tc.table;
+                        let split = table_str.split_once('.');
+                        let origin = match split {
+                            Some((db, tbl)) => Some((db.to_string(), tbl.to_string())),
+                            None => Some((String::new(), table_str.to_string())),
+                        };
+                        (origin, Some(tc.name.as_ref().to_string()))
+                    }
+                    _ => (None, None),
+                };
+                ColumnMeta {
+                    name: c.name().to_string(),
+                    type_name: c.type_info().name().to_string(),
+                    origin,
+                    original_name,
+                }
             })
             .collect()
     } else {
@@ -137,7 +160,7 @@ fn decode_cell(row: &sqlx::mysql::MySqlRow, idx: usize, type_name: &str) -> Cell
             .try_get::<Option<Vec<u8>>, _>(idx)
             .ok()
             .flatten()
-            .map(|b| Cell::Blob(b.len()))
+            .map(Cell::Blob)
             .unwrap_or(Cell::Null),
         "JSON" => row
             .try_get::<Option<String>, _>(idx)
@@ -153,7 +176,7 @@ fn decode_cell(row: &sqlx::mysql::MySqlRow, idx: usize, type_name: &str) -> Cell
                 if b.len() == 1 {
                     Cell::Int(b[0] as i64)
                 } else {
-                    Cell::Blob(b.len())
+                    Cell::Blob(b)
                 }
             })
             .unwrap_or(Cell::Null),
@@ -166,11 +189,10 @@ fn decode_cell(row: &sqlx::mysql::MySqlRow, idx: usize, type_name: &str) -> Cell
             .flatten()
             .map(Cell::Text)
             .unwrap_or_else(|| {
-                // Last resort: maybe it's bytes
                 row.try_get::<Option<Vec<u8>>, _>(idx)
                     .ok()
                     .flatten()
-                    .map(|b| Cell::Blob(b.len()))
+                    .map(Cell::Blob)
                     .unwrap_or(Cell::Null)
             }),
     }

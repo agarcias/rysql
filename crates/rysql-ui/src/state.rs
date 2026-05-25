@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use rysql_db::{DbHandle, SchemaObjects, ServerInfo};
 
+use crate::results::EditRequest;
+
 #[derive(Debug, Clone, Default)]
 pub enum LoadState<T> {
     #[default]
@@ -40,4 +42,5 @@ pub enum PendingExec {
     DropObject { db: String, name: String },
     Truncate { db: String, name: String },
     DropDatabase { db: String },
+    EditCell(EditRequest),
 }

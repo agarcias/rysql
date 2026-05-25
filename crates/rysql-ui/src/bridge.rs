@@ -44,7 +44,29 @@ pub enum UiEvent {
     QueryResult {
         profile: String,
         label: String,
+        /// Original SQL the user typed (without auto-pagination).
+        sql: String,
+        page_size: u64,
         result: Result<QueryResult, String>,
+    },
+    PageAppended {
+        profile: String,
+        tab_id: u64,
+        page_size: u64,
+        result: Result<QueryResult, String>,
+    },
+    PrimaryKey {
+        profile: String,
+        tab_id: u64,
+        result: Result<Vec<String>, String>,
+    },
+    CellEdited {
+        profile: String,
+        tab_id: u64,
+        row: usize,
+        col: usize,
+        new_value: String,
+        result: Result<ExecOutcome, String>,
     },
 }
 
@@ -65,6 +87,21 @@ pub struct Bridge {
     rx: mpsc::UnboundedReceiver<UiEvent>,
 }
 
+/// Handle passed to [`Bridge::spawn_stream`] tasks to emit events back to the
+/// UI thread (with an implicit repaint on every send).
+#[derive(Clone)]
+pub struct EventEmitter {
+    tx: mpsc::UnboundedSender<UiEvent>,
+    ctx: egui::Context,
+}
+
+impl EventEmitter {
+    pub fn send(&self, event: UiEvent) {
+        let _ = self.tx.send(event);
+        self.ctx.request_repaint();
+    }
+}
+
 impl Bridge {
     pub fn new(rt: Handle, ctx: egui::Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -81,6 +118,24 @@ impl Bridge {
             let event = fut.await;
             let _ = tx.send(event);
             ctx.request_repaint();
+        });
+    }
+
+    /// Spawn a task that may emit multiple [`UiEvent`]s over its lifetime.
+    /// Each `send` on the provided emitter triggers a repaint, so the UI
+    /// reacts to per-statement results in a multi-statement script as they
+    /// arrive.
+    pub fn spawn_stream<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(EventEmitter) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let emitter = EventEmitter {
+            tx: self.tx.clone(),
+            ctx: self.ctx.clone(),
+        };
+        self.rt.spawn(async move {
+            f(emitter).await;
         });
     }
 

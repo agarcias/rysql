@@ -122,6 +122,28 @@ pub async fn list_objects(pool: &MySqlPool, db: &str) -> Result<SchemaObjects, A
     Ok(out)
 }
 
+/// Primary-key column names for a table (in key order). Empty if no PK.
+pub async fn primary_key_columns(
+    pool: &MySqlPool,
+    db: &str,
+    table: &str,
+) -> Result<Vec<String>, ActorError> {
+    let rows = sqlx::query(
+        "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(db)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(row.try_get(0)?);
+    }
+    Ok(out)
+}
+
 /// `SHOW CREATE TABLE` / `SHOW CREATE VIEW` / etc. Returns the DDL text.
 pub async fn show_create(
     pool: &MySqlPool,

@@ -59,6 +59,11 @@ enum DbCommand {
         sql: String,
         reply: Reply<QueryResult>,
     },
+    PrimaryKey {
+        db: String,
+        table: String,
+        reply: Reply<Vec<String>>,
+    },
     Shutdown,
 }
 
@@ -119,6 +124,11 @@ impl DbHandle {
         self.request(|reply| DbCommand::Query { sql, reply }).await
     }
 
+    pub async fn primary_key(&self, db: String, table: String) -> Result<Vec<String>, ActorError> {
+        self.request(|reply| DbCommand::PrimaryKey { db, table, reply })
+            .await
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(DbCommand::Shutdown);
     }
@@ -166,6 +176,9 @@ impl DbActor {
                 }
                 DbCommand::Query { sql, reply } => {
                     let _ = reply.send(query::run_query(&self.pool, &sql).await);
+                }
+                DbCommand::PrimaryKey { db, table, reply } => {
+                    let _ = reply.send(schema::primary_key_columns(&self.pool, &db, &table).await);
                 }
                 DbCommand::Shutdown => break,
             }

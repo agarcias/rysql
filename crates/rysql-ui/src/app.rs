@@ -7,7 +7,11 @@ use rysql_db::{build_pool, test_connection, DbActor, ObjectKind};
 use crate::bridge::{Bridge, ExecKind, UiEvent};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::editor::{self, EditorAction, EditorState};
-use crate::results::{self, ResultTab, ResultsAction, ResultsState};
+#[allow(unused_imports)]
+use crate::results::EditRequest;
+use crate::results::{
+    self, EditCellState, EditDialogChoice, ExportFormat, ResultTab, ResultsAction, ResultsState,
+};
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{ActiveConnection, ConfirmAction, LoadState, PendingExec, SchemaState};
 
@@ -162,6 +166,8 @@ impl RysqlApp {
                 UiEvent::QueryResult {
                     profile,
                     label,
+                    sql,
+                    page_size,
                     result,
                 } => {
                     if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
@@ -176,10 +182,109 @@ impl RysqlApp {
                                 qr.columns.len(),
                                 qr.elapsed
                             ));
-                            self.results.push(ResultTab::new(label, qr));
+                            let tab_id = self.results.next_tab_id();
+                            let row_count = qr.rows.len() as u64;
+                            let mut tab = ResultTab::new(tab_id, label, sql, qr);
+                            tab.page_size = page_size;
+                            tab.has_more = row_count >= page_size && page_size > 0;
+                            // Detect single-table origin; if so, ask for PK columns.
+                            if let Some(target) = tab.detect_single_table() {
+                                self.fetch_primary_key(
+                                    tab_id,
+                                    target.db.clone(),
+                                    target.table.clone(),
+                                );
+                                tab.editable = Some(target);
+                            }
+                            self.results.push(tab);
                         }
                         Err(e) => {
                             self.last_error = Some(format!("Query failed: {e}"));
+                        }
+                    }
+                }
+                UiEvent::PageAppended {
+                    profile,
+                    tab_id,
+                    page_size,
+                    result,
+                } => {
+                    if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
+                        continue;
+                    }
+                    match result {
+                        Ok(qr) => {
+                            if let Some(idx) = self.results.find_by_id(tab_id) {
+                                let added = qr.rows.len() as u64;
+                                self.results.tabs[idx].append(qr, page_size);
+                                self.last_info = Some(format!(
+                                    "Appended {} row(s) · total {}",
+                                    added,
+                                    self.results.tabs[idx].result.rows.len()
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Fetch more failed: {e}"));
+                        }
+                    }
+                }
+                UiEvent::PrimaryKey {
+                    profile,
+                    tab_id,
+                    result,
+                } => {
+                    if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
+                        continue;
+                    }
+                    if let Some(idx) = self.results.find_by_id(tab_id) {
+                        match result {
+                            Ok(pk) if !pk.is_empty() => {
+                                if let Some(target) = self.results.tabs[idx].editable.as_mut() {
+                                    target.pk_cols = pk;
+                                }
+                            }
+                            _ => {
+                                self.results.tabs[idx].editable = None;
+                            }
+                        }
+                    }
+                }
+                UiEvent::CellEdited {
+                    profile,
+                    tab_id,
+                    row,
+                    col,
+                    new_value,
+                    result,
+                } => {
+                    if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
+                        continue;
+                    }
+                    match result {
+                        Ok(out) => {
+                            if let Some(idx) = self.results.find_by_id(tab_id) {
+                                let tab = &mut self.results.tabs[idx];
+                                if let Some(cell) =
+                                    tab.result.rows.get_mut(row).and_then(|r| r.get_mut(col))
+                                {
+                                    use rysql_db::Cell;
+                                    *cell = if new_value.eq_ignore_ascii_case("NULL") {
+                                        Cell::Null
+                                    } else {
+                                        Cell::Text(new_value)
+                                    };
+                                }
+                                tab.apply_sort();
+                            }
+                            self.last_error = None;
+                            self.last_info = Some(format!(
+                                "Updated 1 cell · {} row(s) affected · {:.1?}",
+                                out.affected_rows, out.elapsed
+                            ));
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Update failed: {e}"));
                         }
                     }
                 }
@@ -209,28 +314,133 @@ impl RysqlApp {
             self.last_error = Some("Not connected".into());
             return;
         };
+
+        // sqlx's prepared-statement protocol only accepts ONE statement per
+        // call, so we split the buffer client-side. Each statement runs
+        // sequentially and emits its own event so multi-statement scripts
+        // like `USE db; SELECT …;` work as expected.
+        let ranges = rysql_sql::split_statements(&sql);
+        let statements: Vec<String> = if ranges.is_empty() {
+            let trimmed = sql.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            vec![trimmed.to_string()]
+        } else {
+            ranges
+                .into_iter()
+                .map(|r| sql[r].trim().trim_end_matches(';').trim_end().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        if statements.is_empty() {
+            return;
+        }
+
         let profile = active.profile_name.clone();
         let handle = active.handle.clone();
-        let label = sql_label(&sql);
-        if rysql_sql::is_query_returning_rows(&sql) {
-            self.bridge.spawn(async move {
-                let result = handle.query(sql).await.map_err(|e| e.to_string());
-                UiEvent::QueryResult {
-                    profile,
-                    label,
-                    result,
+        let page_size = results::DEFAULT_PAGE_SIZE;
+
+        self.bridge.spawn_stream(move |emitter| async move {
+            for stmt in statements {
+                let label = sql_label(&stmt);
+                if rysql_sql::is_query_returning_rows(&stmt) {
+                    let user_sql = stmt.clone();
+                    let exec_sql = if rysql_sql::has_limit_clause(&stmt) {
+                        stmt
+                    } else {
+                        rysql_sql::inject_pagination(&stmt, page_size, 0)
+                    };
+                    let result = handle.query(exec_sql).await.map_err(|e| e.to_string());
+                    let is_err = result.is_err();
+                    emitter.send(UiEvent::QueryResult {
+                        profile: profile.clone(),
+                        label,
+                        sql: user_sql,
+                        page_size,
+                        result,
+                    });
+                    if is_err {
+                        break;
+                    }
+                } else {
+                    let result = handle.execute(stmt).await.map_err(|e| e.to_string());
+                    let is_err = result.is_err();
+                    emitter.send(UiEvent::ExecResult {
+                        profile: profile.clone(),
+                        kind: ExecKind::Adhoc,
+                        result,
+                    });
+                    if is_err {
+                        break;
+                    }
                 }
-            });
-        } else {
-            self.bridge.spawn(async move {
-                let result = handle.execute(sql).await.map_err(|e| e.to_string());
-                UiEvent::ExecResult {
-                    profile,
-                    kind: ExecKind::Adhoc,
-                    result,
-                }
-            });
-        }
+            }
+        });
+    }
+
+    fn fetch_primary_key(&mut self, tab_id: u64, db: String, table: String) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        self.bridge.spawn(async move {
+            let result = handle
+                .primary_key(db, table)
+                .await
+                .map_err(|e| e.to_string());
+            UiEvent::PrimaryKey {
+                profile,
+                tab_id,
+                result,
+            }
+        });
+    }
+
+    fn fetch_more(&mut self, tab_id: u64, sql: String, offset: u64, limit: u64) {
+        let Some(active) = self.active.as_ref() else {
+            self.last_error = Some("Not connected".into());
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        let exec_sql = rysql_sql::inject_pagination(&sql, limit, offset);
+        self.bridge.spawn(async move {
+            let result = handle.query(exec_sql).await.map_err(|e| e.to_string());
+            UiEvent::PageAppended {
+                profile,
+                tab_id,
+                page_size: limit,
+                result,
+            }
+        });
+    }
+
+    fn run_edit(&mut self, req: results::EditRequest) {
+        let Some(active) = self.active.as_ref() else {
+            self.last_error = Some("Not connected".into());
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        let sql = req.sql.clone();
+        let tab_id = req.tab_id;
+        let row = req.row;
+        let col = req.col;
+        let new_value = req.new_value.clone();
+        self.bridge.spawn(async move {
+            let result = handle.execute(sql).await.map_err(|e| e.to_string());
+            UiEvent::CellEdited {
+                profile,
+                tab_id,
+                row,
+                col,
+                new_value,
+                result,
+            }
+        });
     }
 
     fn apply_results_actions(&mut self, ctx: &egui::Context, actions: Vec<ResultsAction>) {
@@ -245,6 +455,64 @@ impl RysqlApp {
                 ResultsAction::CopyText(text) => {
                     ctx.copy_text(text.clone());
                     self.last_info = Some(format!("Copied: {text}"));
+                }
+                ResultsAction::FetchMore {
+                    tab_id,
+                    sql,
+                    offset,
+                    limit,
+                } => self.fetch_more(tab_id, sql, offset, limit),
+                ResultsAction::Export { tab_idx, format } => {
+                    if let Some(tab) = self.results.tabs.get(tab_idx) {
+                        let payload = results::export(tab, format);
+                        ctx.copy_text(payload);
+                        let what = match format {
+                            ExportFormat::Csv => "CSV",
+                            ExportFormat::Tsv => "TSV",
+                            ExportFormat::Insert => "INSERT statements",
+                        };
+                        self.last_info = Some(format!(
+                            "Copied {} row(s) as {} to clipboard",
+                            tab.result.rows.len(),
+                            what
+                        ));
+                    }
+                }
+                ResultsAction::OpenEdit {
+                    tab_id,
+                    row,
+                    col,
+                    column_name,
+                    original_value,
+                } => {
+                    // Only open if the target tab is still editable.
+                    let editable = self
+                        .results
+                        .find_by_id(tab_id)
+                        .and_then(|i| self.results.tabs[i].editable.as_ref())
+                        .is_some_and(|t| !t.pk_cols.is_empty());
+                    if editable {
+                        self.results.edit_modal = Some(EditCellState {
+                            tab_id,
+                            row,
+                            col,
+                            column_name,
+                            new_value: original_value.clone(),
+                            original_value,
+                        });
+                    } else {
+                        self.last_info = Some("Cell not editable (no detected primary key)".into());
+                    }
+                }
+                ResultsAction::ApplyEdit(req) => {
+                    // First confirm via the existing destructive-confirm modal.
+                    self.confirm = Some(ConfirmAction {
+                        title: format!("Update `{}`", req.tab_id),
+                        message: format!("Apply this UPDATE to row {} of the result?", req.row + 1),
+                        sql: req.preview.clone(),
+                        kind: PendingExec::EditCell(req),
+                    });
+                    self.confirm_typed.clear();
                 }
             }
         }
@@ -484,6 +752,13 @@ impl RysqlApp {
     }
 
     fn execute_pending(&mut self, action: ConfirmAction) {
+        // EditCell uses a different result event so we can update the cell in
+        // place; route it separately.
+        if let PendingExec::EditCell(req) = action.kind {
+            self.run_edit(req);
+            return;
+        }
+
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -494,6 +769,7 @@ impl RysqlApp {
                 ExecKind::AlteredDb(db.clone())
             }
             PendingExec::DropDatabase { .. } => ExecKind::DroppedDatabase,
+            PendingExec::EditCell(_) => unreachable!(),
         };
         let sql = action.sql.clone();
         self.bridge.spawn(async move {
@@ -694,9 +970,70 @@ impl eframe::App for RysqlApp {
 
         self.render_dialog(&ctx);
         self.render_confirm(&ctx);
+
+        let viewer_actions = results::render_blob_viewer(&ctx, &mut self.results.blob_viewer);
+        self.apply_results_actions(&ctx, viewer_actions);
+
+        self.render_edit_modal(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.disconnect();
+    }
+}
+
+impl RysqlApp {
+    fn render_edit_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.results.edit_modal.take() else {
+            return;
+        };
+        let choice = results::render_edit_modal(ctx, &mut state);
+        match choice {
+            EditDialogChoice::None => {
+                self.results.edit_modal = Some(state);
+            }
+            EditDialogChoice::Cancel => {
+                // dropped
+            }
+            EditDialogChoice::Submit => {
+                let tab_idx = match self.results.find_by_id(state.tab_id) {
+                    Some(i) => i,
+                    None => return,
+                };
+                let tab = &self.results.tabs[tab_idx];
+                let Some(target) = tab.editable.as_ref() else {
+                    self.last_error = Some("Cell no longer editable".into());
+                    return;
+                };
+                let Some(row) = tab.result.rows.get(state.row) else {
+                    self.last_error = Some("Row no longer present".into());
+                    return;
+                };
+                match results::build_update_sql(
+                    target,
+                    &tab.result.columns,
+                    row,
+                    state.col,
+                    &state.new_value,
+                ) {
+                    Ok(sql) => {
+                        self.apply_results_actions(
+                            ctx,
+                            vec![ResultsAction::ApplyEdit(EditRequest {
+                                tab_id: state.tab_id,
+                                row: state.row,
+                                col: state.col,
+                                preview: sql.clone(),
+                                sql,
+                                new_value: state.new_value.clone(),
+                            })],
+                        );
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Cannot build UPDATE: {e}"));
+                    }
+                }
+            }
+        }
     }
 }
