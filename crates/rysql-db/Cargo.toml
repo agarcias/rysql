@@ -9,7 +9,7 @@ description = "MySQL/MariaDB driver layer for RySQL (sqlx-based)."
 [dependencies]
 rysql-core = { workspace = true }
 sqlx = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

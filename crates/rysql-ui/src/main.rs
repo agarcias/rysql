@@ -2,6 +2,9 @@ use eframe::egui;
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod bridge;
+mod dialog;
+mod runtime;
 
 use app::RysqlApp;
 
@@ -11,6 +14,9 @@ fn main() -> eframe::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Pre-warm the tokio runtime so it's ready when the first frame renders.
+    let _ = runtime::handle();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

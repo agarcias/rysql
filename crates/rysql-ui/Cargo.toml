@@ -21,7 +21,7 @@ egui = { workspace = true }
 egui_dock = { workspace = true }
 egui_extras = { workspace = true }
 
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 anyhow = { workspace = true }
 
 tracing = { workspace = true }

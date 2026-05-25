@@ -10,3 +10,6 @@ description = "Core types, errors and DB-agnostic traits for RySQL."
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+toml = { workspace = true }
+directories = { workspace = true }
+keyring = { workspace = true }
