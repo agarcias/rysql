@@ -59,8 +59,24 @@ pub struct ConfirmAction {
 
 #[derive(Debug, Clone)]
 pub enum PendingExec {
-    DropObject { db: String, name: String },
-    Truncate { db: String, name: String },
-    DropDatabase { db: String },
+    DropObject {
+        db: String,
+        name: String,
+    },
+    Truncate {
+        db: String,
+        name: String,
+    },
+    DropDatabase {
+        db: String,
+    },
     EditCell(EditRequest),
+    /// Re-create a routine (procedure / function / view) from the user's
+    /// edited Source body. Both statements are executed by
+    /// [`rysql_db::DbHandle::replace_routine`] outside the splitter.
+    ReplaceSource {
+        key: ObjectKey,
+        drop_sql: Option<String>,
+        create_sql: String,
+    },
 }

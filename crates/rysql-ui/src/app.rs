@@ -15,7 +15,7 @@ use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, Test
 use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
 use crate::history_view::{self, HistoryAction, HistoryView};
-use crate::object_view::{ObjectAction, ObjectViewState};
+use crate::object_view::{self, ObjectAction, ObjectViewState};
 #[allow(unused_imports)]
 use crate::results::EditRequest;
 use crate::results::{
@@ -462,6 +462,17 @@ impl RysqlApp {
                 }
             }
             ExecKind::Adhoc => {}
+            ExecKind::ReplaceSource(key) => {
+                // Drop the cached DDL so the next render re-issues
+                // `SHOW CREATE` and we display whatever the server
+                // normalised the body to.
+                if let Some(state) = self.objects.get_mut(key) {
+                    state.source = LoadState::NotLoaded;
+                    state.source_editing = false;
+                    state.source_buffer.clear();
+                    state.source_original.clear();
+                }
+            }
         }
     }
 
@@ -845,9 +856,9 @@ impl RysqlApp {
     }
 
     fn dispatch_object_request(&mut self, key: ObjectKey, action: ObjectAction) {
-        let Some(active) = self.active.as_ref() else {
+        if self.active.is_none() {
             // No live connection: mark every load as a friendly error so the
-            // subtab doesn't spin forever.
+            // subtab doesn't spin forever, and surface Save attempts.
             if let Some(state) = self.objects.get_mut(&key) {
                 let msg = "Not connected".to_string();
                 match action {
@@ -856,10 +867,12 @@ impl RysqlApp {
                     ObjectAction::LoadForeignKeys => state.foreign_keys = LoadState::Error(msg),
                     ObjectAction::LoadSource => state.source = LoadState::Error(msg),
                     ObjectAction::LoadData => state.data = LoadState::Error(msg),
+                    ObjectAction::SaveSource(_) => self.last_error = Some(msg),
                 }
             }
             return;
-        };
+        }
+        let active = self.active.as_ref().unwrap();
         let profile = active.profile_name.clone();
         let handle = active.handle.clone();
         let db = key.db.clone();
@@ -923,7 +936,63 @@ impl RysqlApp {
                 });
             }
             ObjectAction::LoadData => self.load_object_data(key),
+            ObjectAction::SaveSource(body) => self.enqueue_save_source(key, body),
         }
+    }
+
+    /// Build the DROP + CREATE pair for the user's edited Source body and
+    /// route the request through the destructive-confirm modal so the user
+    /// gets a chance to back out.
+    fn enqueue_save_source(&mut self, key: ObjectKey, body: String) {
+        if !object_view::supports_source_editing(key.kind) {
+            self.last_error = Some(format!(
+                "Source editing is not supported for {:?}",
+                key.kind
+            ));
+            return;
+        }
+        let qualified = format!(
+            "`{}`.`{}`",
+            key.db.replace('`', "``"),
+            key.name.replace('`', "``")
+        );
+        let drop_keyword = match key.kind {
+            ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::View => "VIEW",
+            // Excluded by `supports_source_editing`.
+            ObjectKind::Table | ObjectKind::Trigger | ObjectKind::Event => return,
+        };
+        let drop_sql = format!("DROP {drop_keyword} IF EXISTS {qualified}");
+        let preview = format!("{drop_sql};\n\n{body}");
+        let kind_label = match key.kind {
+            ObjectKind::Procedure => "procedure",
+            ObjectKind::Function => "function",
+            ObjectKind::View => "view",
+            _ => "object",
+        };
+        let title = format!("Replace {kind_label} `{}`.`{}`", key.db, key.name);
+        // For views we could use `CREATE OR REPLACE VIEW`, but it requires
+        // surgery on the body the user just edited. DROP + CREATE keeps the
+        // server-side behavior identical for all three kinds at the cost of
+        // a (sub-millisecond) window where the object doesn't exist.
+        let message = format!(
+            "DDL is not transactional in MySQL/MariaDB. If the CREATE fails \
+             after the DROP succeeds, `{}`.`{}` will be left dropped until \
+             you fix and re-save the body.",
+            key.db, key.name
+        );
+        self.confirm = Some(ConfirmAction {
+            title,
+            message,
+            sql: preview,
+            kind: PendingExec::ReplaceSource {
+                key,
+                drop_sql: Some(drop_sql),
+                create_sql: body,
+            },
+        });
+        self.confirm_typed.clear();
     }
 
     /// Run `SELECT * FROM \`db\`.\`tbl\` LIMIT 1000` and route the result
@@ -1191,6 +1260,17 @@ impl RysqlApp {
             self.run_edit(req);
             return;
         }
+        // ReplaceSource ships two statements through `replace_routine`,
+        // bypassing the client-side splitter.
+        if let PendingExec::ReplaceSource {
+            key,
+            drop_sql,
+            create_sql,
+        } = action.kind
+        {
+            self.run_replace_source(key, drop_sql, create_sql);
+            return;
+        }
 
         let Some(active) = self.active.as_ref() else {
             return;
@@ -1202,7 +1282,7 @@ impl RysqlApp {
                 ExecKind::AlteredDb(db.clone())
             }
             PendingExec::DropDatabase { .. } => ExecKind::DroppedDatabase,
-            PendingExec::EditCell(_) => unreachable!(),
+            PendingExec::EditCell(_) | PendingExec::ReplaceSource { .. } => unreachable!(),
         };
         let sql = action.sql.clone();
         self.bridge.spawn(async move {
@@ -1210,6 +1290,26 @@ impl RysqlApp {
             UiEvent::ExecResult {
                 profile,
                 kind: exec_kind,
+                result,
+            }
+        });
+    }
+
+    fn run_replace_source(&mut self, key: ObjectKey, drop_sql: Option<String>, create_sql: String) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        let event_key = key.clone();
+        self.bridge.spawn(async move {
+            let result = handle
+                .replace_routine(drop_sql, create_sql)
+                .await
+                .map_err(|e| e.friendly());
+            UiEvent::ExecResult {
+                profile,
+                kind: ExecKind::ReplaceSource(event_key),
                 result,
             }
         });

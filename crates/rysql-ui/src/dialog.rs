@@ -204,7 +204,9 @@ pub fn show_confirm(
 ) -> ConfirmChoice {
     let mut choice = ConfirmChoice::None;
     egui::Modal::new(egui::Id::new("confirm-modal")).show(ctx, |ui| {
-        ui.set_min_width(440.0);
+        // Wider than the older 440 default so multi-statement DDL previews
+        // (DROP + CREATE for procedures, etc.) don't soft-wrap aggressively.
+        ui.set_min_width(992.0);
         ui.heading(&action.title);
         ui.add_space(8.0);
         ui.label(&action.message);
@@ -212,13 +214,23 @@ pub fn show_confirm(
 
         ui.label(egui::RichText::new("SQL to be executed:").weak().small());
         let mut sql = action.sql.clone();
-        ui.add(
-            egui::TextEdit::multiline(&mut sql)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .interactive(false)
-                .font(egui::TextStyle::Monospace),
-        );
+        // Cap the SQL preview's height: long procedure bodies would push
+        // the Cancel/Confirm row off-screen otherwise. The ScrollArea
+        // shrinks vertically when the content is short, so simple DROP
+        // statements still render compact.
+        egui::ScrollArea::vertical()
+            .id_salt("confirm-sql-scroll")
+            .max_height(512.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut sql)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
         ui.add_space(8.0);
 
         let enabled = match confirm_target(action) {
@@ -262,6 +274,10 @@ fn confirm_target(action: &ConfirmAction) -> Option<String> {
         PendingExec::Truncate { name, .. } => Some(name.clone()),
         PendingExec::DropDatabase { db } => Some(db.clone()),
         PendingExec::EditCell(_) => None,
+        // ReplaceSource is destructive (drops the routine) but the body the
+        // user is about to submit is already visible in the SQL preview; a
+        // type-to-confirm gate on top of that is overkill.
+        PendingExec::ReplaceSource { .. } => None,
     }
 }
 
@@ -272,5 +288,6 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::Truncate { .. } => "table",
         PendingExec::DropDatabase { .. } => "database",
         PendingExec::EditCell(_) => "cell",
+        PendingExec::ReplaceSource { .. } => "routine",
     }
 }

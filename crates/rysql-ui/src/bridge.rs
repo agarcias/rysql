@@ -120,6 +120,10 @@ pub enum ExecKind {
     DroppedDatabase,
     /// Ad-hoc query from the SQL editor — no cache invalidation needed.
     Adhoc,
+    /// The user saved an edited Source for the named object; invalidate its
+    /// Source `LoadState` so the next render re-runs `SHOW CREATE` and clear
+    /// the edit-mode flag on the matching `ObjectViewState`.
+    ReplaceSource(ObjectKey),
 }
 
 pub struct Bridge {

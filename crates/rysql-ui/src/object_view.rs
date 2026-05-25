@@ -32,6 +32,13 @@ pub struct ObjectViewState {
     /// Backed by an entry in [`ResultsState::tabs`] keyed by the inner
     /// `tab_id`. `NotLoaded` until the user enters the Data subtab.
     pub data: LoadState<u64>,
+    /// `true` while the user is editing the Source body. The Source
+    /// `TextEdit` is interactive only in this mode; `source_buffer` is the
+    /// working copy and `source_original` is the snapshot used by Revert
+    /// and the "● modified" indicator.
+    pub source_editing: bool,
+    pub source_buffer: String,
+    pub source_original: String,
 }
 
 impl ObjectViewState {
@@ -46,6 +53,9 @@ impl ObjectViewState {
             foreign_keys: LoadState::NotLoaded,
             source: LoadState::NotLoaded,
             data: LoadState::NotLoaded,
+            source_editing: false,
+            source_buffer: String::new(),
+            source_original: String::new(),
         }
     }
 
@@ -55,19 +65,35 @@ impl ObjectViewState {
             _ => None,
         }
     }
+
+    pub fn source_dirty(&self) -> bool {
+        self.source_editing && self.source_buffer != self.source_original
+    }
+}
+
+/// Object kinds whose Source can be re-created in place via DROP + CREATE
+/// (or `CREATE OR REPLACE`). Tables are excluded — they go through the
+/// Structure subtab's column editor in a later iteration.
+pub fn supports_source_editing(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Procedure | ObjectKind::Function | ObjectKind::View
+    )
 }
 
 /// Intent emitted by [`render`]; the app issues the matching async request
 /// and turns the response into a [`crate::bridge::UiEvent`] that updates the
 /// corresponding `LoadState`.
 #[derive(Debug, Clone)]
-#[allow(clippy::enum_variant_names)]
 pub enum ObjectAction {
     LoadColumns,
     LoadIndexes,
     LoadForeignKeys,
     LoadSource,
     LoadData,
+    /// User clicked Save on the Source editor. Carries the body to send to
+    /// the server (the app prepends the matching `DROP ... IF EXISTS`).
+    SaveSource(String),
 }
 
 pub fn supports_structure(kind: ObjectKind) -> bool {
@@ -432,6 +458,55 @@ fn render_source(
         state.source = LoadState::Loading;
         actions.push(ObjectAction::LoadSource);
     }
+
+    let editing = state.source_editing;
+    let editable_kind = supports_source_editing(state.kind);
+    let mut save_clicked = false;
+
+    // Edit / Save / Revert toolbar — only when the kind supports it and the
+    // DDL has actually loaded (no point in editing a spinner).
+    if editable_kind && matches!(&state.source, LoadState::Loaded(_)) {
+        egui::Panel::top(egui::Id::new((
+            "obj-source-toolbar",
+            &state.db,
+            &state.name,
+        )))
+        .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8, 4)))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                if !editing {
+                    if ui.button("Edit").clicked() {
+                        if let LoadState::Loaded(ddl) = &state.source {
+                            state.source_buffer = ddl.clone();
+                            state.source_original = ddl.clone();
+                            state.source_editing = true;
+                        }
+                    }
+                } else {
+                    if ui.button("Save").clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.button("Revert").clicked() {
+                        state.source_editing = false;
+                        state.source_buffer.clear();
+                        state.source_original.clear();
+                    }
+                    if state.source_dirty() {
+                        ui.label(
+                            egui::RichText::new("● modified")
+                                .color(egui::Color32::from_rgb(0xff, 0xb7, 0x4d))
+                                .small(),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    if save_clicked {
+        actions.push(ObjectAction::SaveSource(state.source_buffer.clone()));
+    }
+
     match &mut state.source {
         LoadState::NotLoaded | LoadState::Loading => {
             ui.horizontal(|ui| {
@@ -443,8 +518,6 @@ fn render_source(
             ui.colored_label(egui::Color32::from_rgb(0xe5, 0x73, 0x73), &*e);
         }
         LoadState::Loaded(ddl) => {
-            // Read-only TextEdit + the editor's SQL highlighter; the user
-            // can still select & copy.
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
                 let mut job = editor::build_layout_job(text.as_str(), highlighter, ui);
                 job.wrap.max_width = wrap_width;
@@ -453,16 +526,27 @@ fn render_source(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let mut buf = ddl.clone();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut buf)
-                            .font(egui::TextStyle::Monospace)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(20)
-                            .interactive(false)
-                            .layouter(&mut layouter),
-                    );
+                    if editing {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut state.source_buffer)
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20)
+                                .layouter(&mut layouter),
+                        );
+                    } else {
+                        let mut buf = ddl.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut buf)
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20)
+                                .interactive(false)
+                                .layouter(&mut layouter),
+                        );
+                    }
                 });
         }
     }

@@ -90,6 +90,16 @@ enum DbCommand {
         table: String,
         reply: Reply<Vec<ForeignKeyInfo>>,
     },
+    /// Re-create a routine (procedure / function / view) by running an
+    /// optional `DROP` followed by the user-supplied `CREATE` body. The
+    /// body is shipped as a single sqlx::query, bypassing the client-side
+    /// statement splitter — which would otherwise mis-cut `;` inside
+    /// `BEGIN ... END`.
+    ReplaceRoutine {
+        drop_sql: Option<String>,
+        create_sql: String,
+        reply: Reply<ExecOutcome>,
+    },
     Shutdown,
 }
 
@@ -182,6 +192,19 @@ impl DbHandle {
             .await
     }
 
+    pub async fn replace_routine(
+        &self,
+        drop_sql: Option<String>,
+        create_sql: String,
+    ) -> Result<ExecOutcome, ActorError> {
+        self.request(|reply| DbCommand::ReplaceRoutine {
+            drop_sql,
+            create_sql,
+            reply,
+        })
+        .await
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(DbCommand::Shutdown);
     }
@@ -242,6 +265,13 @@ impl DbActor {
                 DbCommand::ListForeignKeys { db, table, reply } => {
                     let _ = reply.send(schema::list_foreign_keys(&self.pool, &db, &table).await);
                 }
+                DbCommand::ReplaceRoutine {
+                    drop_sql,
+                    create_sql,
+                    reply,
+                } => {
+                    let _ = reply.send(replace_routine(&self.pool, drop_sql, create_sql).await);
+                }
                 DbCommand::Shutdown => break,
             }
         }
@@ -266,6 +296,28 @@ async fn execute(pool: &MySqlPool, sql: &str) -> Result<ExecOutcome, ActorError>
     let result = sqlx::query(AssertSqlSafe(sql.to_string()))
         .execute(pool)
         .await?;
+    Ok(ExecOutcome {
+        affected_rows: result.rows_affected(),
+        elapsed: start.elapsed(),
+    })
+}
+
+/// Drop (best-effort) then create a routine in a single command. The CREATE
+/// is sent as one `sqlx::query` so the body can contain `;` inside
+/// `BEGIN ... END` without our client-side splitter mis-cutting it. The
+/// drop step is best-effort: if it fails (typically because the routine
+/// doesn't exist) we still attempt the create — the user's CREATE will
+/// fail with a server-side error if something else is wrong.
+async fn replace_routine(
+    pool: &MySqlPool,
+    drop_sql: Option<String>,
+    create_sql: String,
+) -> Result<ExecOutcome, ActorError> {
+    if let Some(drop) = drop_sql {
+        let _ = sqlx::query(AssertSqlSafe(drop)).execute(pool).await;
+    }
+    let start = Instant::now();
+    let result = sqlx::query(AssertSqlSafe(create_sql)).execute(pool).await?;
     Ok(ExecOutcome {
         affected_rows: result.rows_affected(),
         elapsed: start.elapsed(),
