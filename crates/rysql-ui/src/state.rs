@@ -85,4 +85,12 @@ pub enum PendingExec {
     InsertRow {
         tab_id: u64,
     },
+    /// Delete one or many rows from an editable result tab. `rows` are
+    /// indices into `tab.result.rows` (original, not display) — used by
+    /// `invalidate_after` to drop them from the local grid without a
+    /// server round-trip.
+    DeleteRows {
+        tab_id: u64,
+        rows: Vec<usize>,
+    },
 }

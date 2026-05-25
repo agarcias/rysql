@@ -281,6 +281,10 @@ fn confirm_target(action: &ConfirmAction) -> Option<String> {
         // INSERT is non-destructive (it only adds a row); same reasoning —
         // the SQL preview is already in front of the user.
         PendingExec::InsertRow { .. } => None,
+        // DELETE is destructive but the SQL preview already lists the
+        // exact PKs being affected; a type-to-confirm gate on top of that
+        // would be friction without safety.
+        PendingExec::DeleteRows { .. } => None,
     }
 }
 
@@ -293,5 +297,6 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::EditCell(_) => "cell",
         PendingExec::ReplaceSource { .. } => "routine",
         PendingExec::InsertRow { .. } => "row",
+        PendingExec::DeleteRows { .. } => "rows",
     }
 }

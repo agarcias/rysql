@@ -3,6 +3,8 @@
 //! Phase 4b features: pagination (auto-LIMIT + fetch next), BLOB viewer,
 //! export to clipboard (CSV / TSV / INSERT), and edit-in-place by primary key.
 
+use std::collections::HashSet;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use rysql_db::{Cell, ColumnInfo, ColumnMeta, QueryResult};
@@ -49,6 +51,10 @@ pub struct ResultTab {
     pub has_more: bool,
     /// Set after origin + PK detection succeeds.
     pub editable: Option<EditableTarget>,
+    /// Indices into `result.rows` (NOT display order) of rows the user
+    /// ticked via the leading checkbox column. Stored as original indices
+    /// so a sort change doesn't disturb the selection.
+    pub selection: HashSet<usize>,
 }
 
 impl ResultTab {
@@ -62,6 +68,7 @@ impl ResultTab {
             next_offset: result.rows.len() as u64,
             has_more: false,
             editable: None,
+            selection: HashSet::new(),
             result,
             sort_by: None,
             sql,
@@ -304,6 +311,17 @@ pub enum ResultsAction {
     OpenInsert {
         tab_id: u64,
     },
+    /// User triggered a single-row delete (right-click → Delete row…).
+    /// `row` is the index into `tab.result.rows` (original, not display).
+    OpenDeleteRow {
+        tab_id: u64,
+        row: usize,
+    },
+    /// User clicked `Delete N rows…`; the app reads `tab.selection` to
+    /// build the WHERE clause.
+    OpenBulkDelete {
+        tab_id: u64,
+    },
 }
 
 /// Render a single result tab's body (footer + grid). The dock owns the tab
@@ -326,15 +344,26 @@ pub fn render_one(
     let tab = &mut tabs[idx];
 
     // Top toolbar: only meaningful when the tab is editable (single-table,
-    // PK detected). Currently hosts the `+ Add row` button; later days add
-    // bulk-action affordances.
+    // PK detected). Hosts `+ Add row` and the bulk-delete button.
     if tab.editable.is_some() {
+        let selection_count = tab.selection.len();
         egui::Panel::top(egui::Id::new(("results-toolbar", tab_id)))
             .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(6, 4)))
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("+ Add row").clicked() {
                         actions.push(ResultsAction::OpenInsert { tab_id });
+                    }
+                    if selection_count > 0 {
+                        ui.separator();
+                        let label = format!("Delete {selection_count} row(s)…");
+                        let btn = egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
+                        );
+                        if ui.add(btn).clicked() {
+                            actions.push(ResultsAction::OpenBulkDelete { tab_id });
+                        }
                     }
                 });
             });
@@ -393,9 +422,22 @@ fn render_table(
     let text_height = ui.text_style_height(&egui::TextStyle::Body);
     let row_height = text_height + 4.0;
     let n_cols = tab.result.columns.len();
-    let table_min_width = 60.0 + (n_cols as f32) * 160.0;
+    // Show the row checkbox column only when the tab is editable AND the
+    // PK was successfully detected — without a PK there's nothing to base
+    // the DELETE WHERE on.
+    let has_checkbox = tab
+        .editable
+        .as_ref()
+        .map(|t| !t.pk_cols.is_empty())
+        .unwrap_or(false);
+    let table_min_width = 60.0 + (n_cols as f32) * 160.0 + if has_checkbox { 32.0 } else { 0.0 };
     let mut sort_click: Option<usize> = None;
     let mut edit_request: Option<(usize, usize)> = None;
+    let mut delete_row_request: Option<usize> = None;
+    let mut select_all_request: Option<bool> = None;
+    let mut toggle_row_request: Option<(usize, bool)> = None;
+    let total_rows = tab.result.rows.len();
+    let all_selected = has_checkbox && total_rows > 0 && tab.selection.len() == total_rows;
 
     egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
@@ -405,14 +447,25 @@ fn render_table(
             let mut builder = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto().at_least(40.0).resizable(true));
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            if has_checkbox {
+                builder = builder.column(Column::exact(28.0));
+            }
+            builder = builder.column(Column::auto().at_least(40.0).resizable(true));
             for _ in 0..n_cols {
                 builder = builder.column(Column::initial(160.0).at_least(40.0).resizable(true));
             }
 
             builder
                 .header(row_height + 4.0, |mut header| {
+                    if has_checkbox {
+                        header.col(|ui| {
+                            let mut checked = all_selected;
+                            if ui.checkbox(&mut checked, "").changed() {
+                                select_all_request = Some(checked);
+                            }
+                        });
+                    }
                     header.col(|ui| {
                         ui.label(egui::RichText::new("#").weak().small());
                     });
@@ -445,6 +498,14 @@ fn render_table(
                         let original_idx = tab.order[display_idx];
                         let cells = &tab.result.rows[original_idx];
 
+                        if has_checkbox {
+                            row.col(|ui| {
+                                let mut checked = tab.selection.contains(&original_idx);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    toggle_row_request = Some((original_idx, checked));
+                                }
+                            });
+                        }
                         row.col(|ui| {
                             ui.label(
                                 egui::RichText::new((original_idx + 1).to_string())
@@ -475,6 +536,9 @@ fn render_table(
                                     CellAction::Edit => {
                                         edit_request = Some((original_idx, col_idx));
                                     }
+                                    CellAction::DeleteRow => {
+                                        delete_row_request = Some(original_idx);
+                                    }
                                 }
                             });
                         }
@@ -484,6 +548,21 @@ fn render_table(
 
     if let Some(i) = sort_click {
         tab.cycle_sort(i);
+    }
+
+    if let Some(checked) = select_all_request {
+        if checked {
+            tab.selection = (0..total_rows).collect();
+        } else {
+            tab.selection.clear();
+        }
+    }
+    if let Some((idx, checked)) = toggle_row_request {
+        if checked {
+            tab.selection.insert(idx);
+        } else {
+            tab.selection.remove(&idx);
+        }
     }
 
     if let Some((row, col)) = edit_request {
@@ -497,6 +576,13 @@ fn render_table(
             });
         }
     }
+
+    if let Some(row) = delete_row_request {
+        actions.push(ResultsAction::OpenDeleteRow {
+            tab_id: tab.tab_id,
+            row,
+        });
+    }
 }
 
 enum CellAction {
@@ -504,6 +590,9 @@ enum CellAction {
     Copy,
     OpenBlob,
     Edit,
+    /// User picked "Delete row…" from the cell context menu — the row
+    /// behind the clicked cell is the target.
+    DeleteRow,
 }
 
 fn render_cell(ui: &mut egui::Ui, cell: &Cell, editable: bool) -> CellAction {
@@ -560,6 +649,13 @@ fn render_cell(ui: &mut egui::Ui, cell: &Cell, editable: bool) -> CellAction {
         if editable && !matches!(cell, Cell::Blob(_)) && ui.button("Edit cell…").clicked() {
             out = CellAction::Edit;
             ui.close();
+        }
+        if editable {
+            ui.separator();
+            if ui.button("Delete row…").clicked() {
+                out = CellAction::DeleteRow;
+                ui.close();
+            }
         }
     });
     out
@@ -1133,5 +1229,105 @@ fn set_mode(v: &mut InsertValue, mode: InsertMode) {
         (_, InsertMode::Value) => *v = InsertValue::Text(String::new()),
         (_, InsertMode::Null) => *v = InsertValue::Null,
         (_, InsertMode::Default) => *v = InsertValue::Default,
+    }
+}
+
+// ===== Delete rows =====
+
+/// Build a `DELETE FROM db.tbl WHERE …` SQL statement for one or many rows
+/// of an editable result tab. Branches on PK arity:
+///   - single PK + 1 row  → `WHERE \`pk\` = literal`
+///   - single PK + N rows → `WHERE \`pk\` IN (l1, l2, …)`
+///   - composite PK + 1   → `WHERE (\`pk1\`, \`pk2\`) = (l1, l2)`
+///   - composite PK + N   → `WHERE (\`pk1\`, \`pk2\`) IN ((…), (…))`
+pub fn build_delete_sql(
+    target: &EditableTarget,
+    columns: &[ColumnMeta],
+    rows: &[Vec<Cell>],
+    row_indices: &[usize],
+) -> Result<String, String> {
+    if target.pk_cols.is_empty() {
+        return Err("no primary key available".into());
+    }
+    if row_indices.is_empty() {
+        return Err("no rows selected".into());
+    }
+
+    // Resolve PK column positions in the result so we can read literals
+    // straight out of each row.
+    let mut pk_col_indices = Vec::with_capacity(target.pk_cols.len());
+    for pk in &target.pk_cols {
+        let i = columns
+            .iter()
+            .position(|c| c.original_name.as_deref() == Some(pk.as_str()) || c.name == *pk)
+            .ok_or_else(|| format!("PK column `{pk}` not present in result"))?;
+        pk_col_indices.push(i);
+    }
+
+    // For each requested row, collect the tuple of PK literals.
+    let mut tuples: Vec<Vec<String>> = Vec::with_capacity(row_indices.len());
+    for &row_idx in row_indices {
+        let row = rows
+            .get(row_idx)
+            .ok_or_else(|| format!("row index {row_idx} out of range"))?;
+        let mut tuple = Vec::with_capacity(pk_col_indices.len());
+        for (k, &col_idx) in pk_col_indices.iter().enumerate() {
+            let cell = row
+                .get(col_idx)
+                .ok_or_else(|| "row too short for PK".to_string())?;
+            let literal = sql_literal(cell);
+            if literal.starts_with("NULL") {
+                return Err(format!(
+                    "PK column `{}` is NULL — cannot delete row",
+                    target.pk_cols[k]
+                ));
+            }
+            tuple.push(literal);
+        }
+        tuples.push(tuple);
+    }
+
+    let db = target.db.replace('`', "``");
+    let table = target.table.replace('`', "``");
+
+    if target.pk_cols.len() == 1 {
+        let pk = target.pk_cols[0].replace('`', "``");
+        if tuples.len() == 1 {
+            return Ok(format!(
+                "DELETE FROM `{db}`.`{table}` WHERE `{pk}` = {}",
+                tuples[0][0]
+            ));
+        }
+        let values: Vec<String> = tuples
+            .into_iter()
+            .map(|t| t.into_iter().next().unwrap())
+            .collect();
+        return Ok(format!(
+            "DELETE FROM `{db}`.`{table}` WHERE `{pk}` IN ({})",
+            values.join(", ")
+        ));
+    }
+
+    let cols_list: Vec<String> = target
+        .pk_cols
+        .iter()
+        .map(|p| format!("`{}`", p.replace('`', "``")))
+        .collect();
+    let tuple_strs: Vec<String> = tuples
+        .iter()
+        .map(|t| format!("({})", t.join(", ")))
+        .collect();
+    if tuple_strs.len() == 1 {
+        Ok(format!(
+            "DELETE FROM `{db}`.`{table}` WHERE ({}) = {}",
+            cols_list.join(", "),
+            tuple_strs[0]
+        ))
+    } else {
+        Ok(format!(
+            "DELETE FROM `{db}`.`{table}` WHERE ({}) IN ({})",
+            cols_list.join(", "),
+            tuple_strs.join(", ")
+        ))
     }
 }

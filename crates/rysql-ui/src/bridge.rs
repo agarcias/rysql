@@ -146,6 +146,10 @@ pub enum ExecKind {
     /// refreshes the tab (or its backing Object data subtab) so server-side
     /// changes (auto_increment, defaults) become visible.
     InsertedRow { tab_id: u64 },
+    /// One or many rows were deleted from a result tab; their indices into
+    /// `tab.result.rows` (original, not display) are carried so the
+    /// handler can drop them locally without a server refresh.
+    DeletedRows { tab_id: u64, rows: Vec<usize> },
 }
 
 pub struct Bridge {

@@ -525,7 +525,33 @@ impl RysqlApp {
             ExecKind::InsertedRow { tab_id } => {
                 self.refresh_after_row_insert(*tab_id);
             }
+            ExecKind::DeletedRows { tab_id, rows } => {
+                self.apply_local_delete(*tab_id, rows);
+            }
         }
+    }
+
+    /// Drop the just-deleted rows from the local grid. No server refresh:
+    /// we'd lose pagination and the rows are guaranteed gone from the
+    /// server side. Rebuilds `order` via `apply_sort` so any active sort
+    /// is preserved.
+    fn apply_local_delete(&mut self, tab_id: u64, rows: &[usize]) {
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let tab = &mut self.results.tabs[idx];
+        let to_remove: std::collections::HashSet<usize> = rows.iter().copied().collect();
+        let mut walking = 0usize;
+        tab.result.rows.retain(|_| {
+            let keep = !to_remove.contains(&walking);
+            walking += 1;
+            keep
+        });
+        // Local rows changed → indices invalidated; selection is stale,
+        // sort order needs a rebuild.
+        tab.selection.clear();
+        tab.next_offset = tab.result.rows.len() as u64;
+        tab.apply_sort();
     }
 
     /// Pick the right refresh strategy for the tab that just received an
@@ -809,6 +835,76 @@ impl RysqlApp {
                     self.confirm_typed.clear();
                 }
                 ResultsAction::OpenInsert { tab_id } => self.open_insert_modal(tab_id),
+                ResultsAction::OpenDeleteRow { tab_id, row } => {
+                    self.open_delete_confirm(tab_id, vec![row]);
+                }
+                ResultsAction::OpenBulkDelete { tab_id } => {
+                    let rows: Vec<usize> = match self.results.find_by_id(tab_id) {
+                        Some(idx) => {
+                            let mut rows: Vec<usize> =
+                                self.results.tabs[idx].selection.iter().copied().collect();
+                            rows.sort_unstable();
+                            rows
+                        }
+                        None => continue,
+                    };
+                    if rows.is_empty() {
+                        self.last_info = Some("No rows selected".into());
+                        continue;
+                    }
+                    self.open_delete_confirm(tab_id, rows);
+                }
+            }
+        }
+    }
+
+    /// Build the DELETE SQL for the given row indices and push the
+    /// destructive-confirm modal. Used by both the single-row context-menu
+    /// path and the bulk `Delete N rows…` toolbar button.
+    fn open_delete_confirm(&mut self, tab_id: u64, rows: Vec<usize>) {
+        let Some(idx) = self.results.find_by_id(tab_id) else {
+            return;
+        };
+        let tab = &self.results.tabs[idx];
+        let Some(target) = tab.editable.as_ref() else {
+            self.last_info = Some("Result is not editable (need a single-table origin)".into());
+            return;
+        };
+        if target.pk_cols.is_empty() {
+            self.last_info = Some("No primary key detected — cannot delete".into());
+            return;
+        }
+        match results::build_delete_sql(target, &tab.result.columns, &tab.result.rows, &rows) {
+            Ok(sql) => {
+                let count = rows.len();
+                let title = if count == 1 {
+                    format!("Delete row from `{}`.`{}`", target.db, target.table)
+                } else {
+                    format!(
+                        "Delete {count} rows from `{}`.`{}`",
+                        target.db, target.table
+                    )
+                };
+                let message = if count == 1 {
+                    "Apply this DELETE? The row will disappear from the grid \
+                     immediately on success."
+                        .to_string()
+                } else {
+                    format!(
+                        "Apply this DELETE? {count} row(s) will disappear from \
+                         the grid immediately on success."
+                    )
+                };
+                self.confirm = Some(ConfirmAction {
+                    title,
+                    message,
+                    sql,
+                    kind: PendingExec::DeleteRows { tab_id, rows },
+                });
+                self.confirm_typed.clear();
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Cannot build DELETE: {e}"));
             }
         }
     }
@@ -1417,6 +1513,10 @@ impl RysqlApp {
             }
             PendingExec::DropDatabase { .. } => ExecKind::DroppedDatabase,
             PendingExec::InsertRow { tab_id, .. } => ExecKind::InsertedRow { tab_id: *tab_id },
+            PendingExec::DeleteRows { tab_id, rows } => ExecKind::DeletedRows {
+                tab_id: *tab_id,
+                rows: rows.clone(),
+            },
             PendingExec::EditCell(_) | PendingExec::ReplaceSource { .. } => unreachable!(),
         };
         let sql = action.sql.clone();
