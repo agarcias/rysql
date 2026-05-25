@@ -11,6 +11,7 @@ use rysql_sql::Highlighter;
 use tokio::task::AbortHandle;
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
+use crate::column_dialog::{self, ColumnEditChoice, ColumnEditState};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
@@ -45,6 +46,8 @@ pub struct RysqlApp {
     /// Dedicated highlighter for the Source subtab so the editor's
     /// highlighter can be borrowed independently each frame.
     source_highlighter: Highlighter,
+    /// Open instance of the column add/modify modal (one at a time).
+    column_edit_modal: Option<ColumnEditState>,
     settings: AppSettings,
     settings_store: SettingsStore,
     history_store: HistoryStore,
@@ -103,6 +106,7 @@ impl RysqlApp {
             results: ResultsState::default(),
             objects: HashMap::new(),
             source_highlighter: Highlighter::new_dark(),
+            column_edit_modal: None,
             settings,
             settings_store,
             history_store,
@@ -535,6 +539,22 @@ impl RysqlApp {
                 new_value,
             } => {
                 self.apply_local_bulk_update(*tab_id, rows, *col_idx, new_value);
+            }
+            ExecKind::AlteredColumns(key) => {
+                // ALTER COLUMN may shift PKs, defaults and auto_increment,
+                // and the existing Data result is now stale (columns may
+                // have changed). Invalidate everything the Object view
+                // owns so the next render re-fetches.
+                let stale_data_tab = self.objects.get(key).and_then(|s| s.data_tab_id());
+                if let Some(tab_id) = stale_data_tab {
+                    self.results.remove_by_id(tab_id);
+                }
+                if let Some(state) = self.objects.get_mut(key) {
+                    state.columns = LoadState::NotLoaded;
+                    state.indexes = LoadState::NotLoaded;
+                    state.foreign_keys = LoadState::NotLoaded;
+                    state.data = LoadState::NotLoaded;
+                }
             }
         }
     }
@@ -1175,7 +1195,9 @@ impl RysqlApp {
                     ObjectAction::LoadForeignKeys => state.foreign_keys = LoadState::Error(msg),
                     ObjectAction::LoadSource => state.source = LoadState::Error(msg),
                     ObjectAction::LoadData => state.data = LoadState::Error(msg),
-                    ObjectAction::SaveSource(_) => self.last_error = Some(msg),
+                    ObjectAction::SaveSource(_)
+                    | ObjectAction::AddColumn
+                    | ObjectAction::DropColumn { .. } => self.last_error = Some(msg),
                 }
             }
             return;
@@ -1245,7 +1267,29 @@ impl RysqlApp {
             }
             ObjectAction::LoadData => self.load_object_data(key),
             ObjectAction::SaveSource(body) => self.enqueue_save_source(key, body),
+            ObjectAction::AddColumn => {
+                self.column_edit_modal = Some(ColumnEditState::new_add(key));
+            }
+            ObjectAction::DropColumn { name } => self.enqueue_drop_column(key, name),
         }
+    }
+
+    /// Build `ALTER TABLE … DROP COLUMN …` and route through the
+    /// destructive-confirm modal. Type-to-confirm gate uses the column
+    /// name (set by `dialog::confirm_target`).
+    fn enqueue_drop_column(&mut self, key: ObjectKey, name: String) {
+        let sql = column_dialog::build_drop_column_sql(&key, &name);
+        self.confirm = Some(ConfirmAction {
+            title: format!("Drop column `{name}` from `{}`.`{}`", key.db, key.name),
+            message: format!(
+                "This will permanently delete the `{name}` column and all of \
+                 its data from `{}`.`{}`.",
+                key.db, key.name
+            ),
+            sql,
+            kind: PendingExec::DropColumn { key, name },
+        });
+        self.confirm_typed.clear();
     }
 
     /// Build the DROP + CREATE pair for the user's edited Source body and
@@ -1606,6 +1650,9 @@ impl RysqlApp {
                 col_idx: *col_idx,
                 new_value: new_value.clone(),
             },
+            PendingExec::AlterColumn { key } | PendingExec::DropColumn { key, .. } => {
+                ExecKind::AlteredColumns(key.clone())
+            }
             PendingExec::EditCell(_) | PendingExec::ReplaceSource { .. } => unreachable!(),
         };
         let sql = action.sql.clone();
@@ -1910,6 +1957,7 @@ impl eframe::App for RysqlApp {
         self.render_edit_modal(&ctx);
         self.render_insert_modal(&ctx);
         self.render_bulk_update_modal(&ctx);
+        self.render_column_edit_modal(&ctx);
         self.render_history(&ctx);
     }
 
@@ -2077,6 +2125,37 @@ impl RysqlApp {
                         col_idx,
                         new_value,
                     },
+                });
+                self.confirm_typed.clear();
+            }
+        }
+    }
+
+    fn render_column_edit_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.column_edit_modal.take() else {
+            return;
+        };
+        let choice = column_dialog::render_column_edit_modal(ctx, &mut state);
+        match choice {
+            ColumnEditChoice::None => {
+                self.column_edit_modal = Some(state);
+            }
+            ColumnEditChoice::Cancel => {
+                // dropped
+            }
+            ColumnEditChoice::Submit { sql } => {
+                self.confirm = Some(ConfirmAction {
+                    title: format!(
+                        "Add column `{}` to `{}`.`{}`",
+                        state.name.trim(),
+                        state.key.db,
+                        state.key.name
+                    ),
+                    message: "Apply this ALTER TABLE? The Structure subtab \
+                              and any open Data subtab will refresh on success."
+                        .into(),
+                    sql,
+                    kind: PendingExec::AlterColumn { key: state.key },
                 });
                 self.confirm_typed.clear();
             }

@@ -94,6 +94,14 @@ pub enum ObjectAction {
     /// User clicked Save on the Source editor. Carries the body to send to
     /// the server (the app prepends the matching `DROP ... IF EXISTS`).
     SaveSource(String),
+    /// User clicked `+ Add column` below the Columns table. The app opens
+    /// the column-edit modal seeded for Add.
+    AddColumn,
+    /// User clicked `[Drop]` on a column row. The app builds the DROP SQL
+    /// and pushes the destructive-confirm modal.
+    DropColumn {
+        name: String,
+    },
 }
 
 pub fn supports_structure(kind: ObjectKind) -> bool {
@@ -105,6 +113,14 @@ pub fn supports_data(kind: ObjectKind) -> bool {
 }
 
 pub fn supports_foreign_keys(kind: ObjectKind) -> bool {
+    matches!(kind, ObjectKind::Table)
+}
+
+/// Whether the Structure subtab should expose Add / Drop / Modify column
+/// affordances. Views are listed by `information_schema.COLUMNS` but they
+/// can't be `ALTER`-ed column-by-column; the user must recreate the view
+/// from the Source subtab instead.
+pub fn supports_column_editing(kind: ObjectKind) -> bool {
     matches!(kind, ObjectKind::Table)
 }
 
@@ -213,12 +229,21 @@ fn render_structure(
         actions.push(ObjectAction::LoadForeignKeys);
     }
 
+    let editable = supports_column_editing(state.kind);
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Columns").strong());
-            render_columns(ui, &state.columns);
+            render_columns(ui, &state.columns, editable, actions);
+
+            if editable {
+                ui.add_space(4.0);
+                if ui.button("+ Add column").clicked() {
+                    actions.push(ObjectAction::AddColumn);
+                }
+            }
 
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Indexes").strong());
@@ -236,7 +261,12 @@ fn render_structure(
         });
 }
 
-fn render_columns(ui: &mut egui::Ui, columns: &LoadState<Vec<ColumnInfo>>) {
+fn render_columns(
+    ui: &mut egui::Ui,
+    columns: &LoadState<Vec<ColumnInfo>>,
+    editable: bool,
+    actions: &mut Vec<ObjectAction>,
+) {
     match columns {
         LoadState::NotLoaded | LoadState::Loading => {
             ui.horizontal(|ui| {
@@ -252,7 +282,8 @@ fn render_columns(ui: &mut egui::Ui, columns: &LoadState<Vec<ColumnInfo>>) {
         }
         LoadState::Loaded(cols) => {
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-            TableBuilder::new(ui)
+            let mut drop_request: Option<String> = None;
+            let mut builder = TableBuilder::new(ui)
                 .id_salt(("obj-cols",))
                 .striped(true)
                 .resizable(true)
@@ -263,11 +294,24 @@ fn render_columns(ui: &mut egui::Ui, columns: &LoadState<Vec<ColumnInfo>>) {
                 .column(Column::initial(40.0).at_least(30.0)) // pk
                 .column(Column::initial(120.0).at_least(40.0).resizable(true)) // default
                 .column(Column::initial(180.0).at_least(40.0).resizable(true)) // extra
-                .column(Column::remainder().at_least(80.0).resizable(true)) // comment
+                .column(Column::initial(160.0).at_least(60.0).resizable(true)); // comment
+            if editable {
+                builder = builder.column(Column::exact(70.0)); // actions
+            } else {
+                builder = builder.column(Column::remainder().at_least(80.0));
+            }
+            let headers: &[&str] = if editable {
+                &[
+                    "Name", "Type", "Null", "PK", "Default", "Extra", "Comment", "",
+                ]
+            } else {
+                &["Name", "Type", "Null", "PK", "Default", "Extra", "Comment"]
+            };
+            builder
                 .header(row_h, |mut header| {
-                    for label in ["Name", "Type", "Null", "PK", "Default", "Extra", "Comment"] {
+                    for label in headers {
                         header.col(|ui| {
-                            ui.label(egui::RichText::new(label).strong().small());
+                            ui.label(egui::RichText::new(*label).strong().small());
                         });
                     }
                 })
@@ -301,8 +345,25 @@ fn render_columns(ui: &mut egui::Ui, columns: &LoadState<Vec<ColumnInfo>>) {
                         row.col(|ui| {
                             ui.add(egui::Label::new(&c.comment).truncate());
                         });
+                        if editable {
+                            row.col(|ui| {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Drop")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
+                                );
+                                if ui.add(btn).on_hover_text("Drop this column").clicked() {
+                                    drop_request = Some(c.name.clone());
+                                }
+                            });
+                        } else {
+                            row.col(|_ui| {});
+                        }
                     });
                 });
+            if let Some(name) = drop_request {
+                actions.push(ObjectAction::DropColumn { name });
+            }
         }
     }
 }

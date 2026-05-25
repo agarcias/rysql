@@ -288,6 +288,12 @@ fn confirm_target(action: &ConfirmAction) -> Option<String> {
         // Bulk UPDATE is non-destructive (rows aren't lost, only one
         // column changes); same reasoning as InsertRow.
         PendingExec::BulkUpdate { .. } => None,
+        // ALTER … ADD/MODIFY COLUMN: schema change but data is not lost
+        // by itself; the SQL preview already shows the full ALTER.
+        PendingExec::AlterColumn { .. } => None,
+        // DROP COLUMN deletes a whole column of data — type the column
+        // name to confirm.
+        PendingExec::DropColumn { name, .. } => Some(name.clone()),
     }
 }
 
@@ -302,5 +308,7 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::InsertRow { .. } => "row",
         PendingExec::DeleteRows { .. } => "rows",
         PendingExec::BulkUpdate { .. } => "rows",
+        PendingExec::AlterColumn { .. } => "column",
+        PendingExec::DropColumn { .. } => "column",
     }
 }

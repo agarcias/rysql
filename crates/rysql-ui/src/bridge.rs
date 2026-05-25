@@ -159,6 +159,10 @@ pub enum ExecKind {
         col_idx: usize,
         new_value: String,
     },
+    /// `ALTER TABLE` against the named object touched its columns.
+    /// Invalidates the matching ObjectViewState's columns / indexes /
+    /// foreign_keys / data so the next render re-fetches.
+    AlteredColumns(ObjectKey),
 }
 
 pub struct Bridge {

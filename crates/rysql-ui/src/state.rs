@@ -103,4 +103,16 @@ pub enum PendingExec {
         /// post-exec handler turns it into `Cell::Null` / `Cell::Text`.
         new_value: String,
     },
+    /// Non-destructive column edit: `ALTER TABLE … ADD COLUMN …` or (Day 6)
+    /// `CHANGE COLUMN …`. After execute we invalidate the Object view's
+    /// columns/indexes/foreign_keys/data so the next render re-fetches.
+    AlterColumn {
+        key: ObjectKey,
+    },
+    /// `ALTER TABLE … DROP COLUMN …`. Data loss is permanent, so the
+    /// confirm modal requires the user to type the column name.
+    DropColumn {
+        key: ObjectKey,
+        name: String,
+    },
 }

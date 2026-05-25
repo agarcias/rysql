@@ -2,6 +2,7 @@ use eframe::egui;
 
 mod app;
 mod bridge;
+mod column_dialog;
 mod dialog;
 mod dock;
 mod editor;
