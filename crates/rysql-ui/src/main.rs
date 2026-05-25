@@ -8,6 +8,7 @@ mod editor;
 mod fonts;
 mod history_view;
 mod logging;
+mod object_view;
 mod results;
 mod runtime;
 mod sidebar;

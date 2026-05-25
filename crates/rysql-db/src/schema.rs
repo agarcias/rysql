@@ -122,6 +122,171 @@ pub async fn list_objects(pool: &MySqlPool, db: &str) -> Result<SchemaObjects, A
     Ok(out)
 }
 
+/// One row in the Structure subtab's "Columns" table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub name: String,
+    /// Full column type as MariaDB/MySQL reports it (e.g. `"varchar(255)"`,
+    /// `"decimal(10,2) unsigned"`).
+    pub data_type: String,
+    pub nullable: bool,
+    pub default_value: Option<String>,
+    pub is_pk: bool,
+    /// Free-form column extras: `"auto_increment"`,
+    /// `"on update CURRENT_TIMESTAMP"`, etc.
+    pub extra: String,
+    pub comment: String,
+}
+
+/// One row in the Structure subtab's "Indexes" table. A composite index
+/// shows up as a single entry with multiple `columns`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    /// `"BTREE"`, `"HASH"`, `"FULLTEXT"`, …
+    pub index_type: String,
+}
+
+/// One row in the Structure subtab's "Foreign keys" section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_db: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: String,
+    pub on_update: String,
+}
+
+/// Detailed columns for a table or view. Ordered by `ORDINAL_POSITION`.
+pub async fn list_columns(
+    pool: &MySqlPool,
+    db: &str,
+    table: &str,
+) -> Result<Vec<ColumnInfo>, ActorError> {
+    let rows = sqlx::query(
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, \
+                COLUMN_KEY, EXTRA, COLUMN_COMMENT \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(db)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let nullable: String = row.try_get(2)?;
+        let key: String = row.try_get(4)?;
+        out.push(ColumnInfo {
+            name: row.try_get(0)?,
+            data_type: row.try_get(1)?,
+            nullable: nullable.eq_ignore_ascii_case("YES"),
+            default_value: row.try_get(3).ok(),
+            is_pk: key.eq_ignore_ascii_case("PRI"),
+            extra: row.try_get(5)?,
+            comment: row.try_get(6)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Indexes on a table grouped by `INDEX_NAME` (so a composite index appears
+/// as a single [`IndexInfo`] with multiple columns).
+pub async fn list_indexes(
+    pool: &MySqlPool,
+    db: &str,
+    table: &str,
+) -> Result<Vec<IndexInfo>, ActorError> {
+    let rows = sqlx::query(
+        "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, INDEX_TYPE, SEQ_IN_INDEX \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(db)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<IndexInfo> = Vec::new();
+    for row in rows {
+        let name: String = row.try_get(0)?;
+        let col: String = row.try_get(1)?;
+        // `NON_UNIQUE` is reported by MariaDB as a stringy bigint; pull it as
+        // i64 first for resilience across server versions.
+        let non_unique: i64 = row.try_get(2).unwrap_or(0);
+        let index_type: String = row.try_get(3).unwrap_or_default();
+        match out.iter_mut().find(|i| i.name == name) {
+            Some(existing) => existing.columns.push(col),
+            None => out.push(IndexInfo {
+                name,
+                columns: vec![col],
+                unique: non_unique == 0,
+                index_type,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// Outgoing foreign keys defined on `db.table`. Joins
+/// `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS` so we can carry the
+/// `ON DELETE` / `ON UPDATE` rules.
+pub async fn list_foreign_keys(
+    pool: &MySqlPool,
+    db: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, ActorError> {
+    let rows = sqlx::query(
+        "SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
+                kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, \
+                kcu.REFERENCED_COLUMN_NAME, kcu.ORDINAL_POSITION, \
+                rc.DELETE_RULE, rc.UPDATE_RULE \
+         FROM information_schema.KEY_COLUMN_USAGE kcu \
+         JOIN information_schema.REFERENTIAL_CONSTRAINTS rc \
+           ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
+          AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+          AND rc.TABLE_NAME = kcu.TABLE_NAME \
+         WHERE kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ? \
+           AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+    )
+    .bind(db)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<ForeignKeyInfo> = Vec::new();
+    for row in rows {
+        let name: String = row.try_get(0)?;
+        let col: String = row.try_get(1)?;
+        let ref_db: String = row.try_get(2)?;
+        let ref_table: String = row.try_get(3)?;
+        let ref_col: String = row.try_get(4)?;
+        let on_delete: String = row.try_get(6).unwrap_or_default();
+        let on_update: String = row.try_get(7).unwrap_or_default();
+        match out.iter_mut().find(|fk| fk.name == name) {
+            Some(existing) => {
+                existing.columns.push(col);
+                existing.ref_columns.push(ref_col);
+            }
+            None => out.push(ForeignKeyInfo {
+                name,
+                columns: vec![col],
+                ref_db,
+                ref_table,
+                ref_columns: vec![ref_col],
+                on_delete,
+                on_update,
+            }),
+        }
+    }
+    Ok(out)
+}
+
 /// Primary-key column names for a table (in key order). Empty if no PK.
 pub async fn primary_key_columns(
     pool: &MySqlPool,
@@ -171,7 +336,7 @@ pub async fn show_create(
     Ok(ddl)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     Table,
     View,

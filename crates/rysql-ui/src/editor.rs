@@ -482,7 +482,11 @@ fn char_index_from_byte(text: &str, byte_idx: usize) -> usize {
     text[..byte_idx].chars().count()
 }
 
-fn build_layout_job(text: &str, highlighter: &mut Highlighter, ui: &egui::Ui) -> LayoutJob {
+pub(crate) fn build_layout_job(
+    text: &str,
+    highlighter: &mut Highlighter,
+    ui: &egui::Ui,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let font_id = FontId::monospace(ui.style().text_styles[&egui::TextStyle::Monospace].size);
     for line_with_nl in split_keep_newlines(text) {

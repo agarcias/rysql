@@ -19,6 +19,12 @@ pub enum SidebarAction {
         kind: ObjectKind,
         name: String,
     },
+    /// Double-click on a schema-tree item: open (or focus) its dock tab.
+    OpenObject {
+        db: String,
+        kind: ObjectKind,
+        name: String,
+    },
     Confirm(ConfirmAction),
 }
 
@@ -317,7 +323,22 @@ fn render_category(
                         .show_tooltip_when_elided(true)
                         .sense(egui::Sense::click()),
                 );
+                if resp.double_clicked() {
+                    actions.push(SidebarAction::OpenObject {
+                        db: db.to_string(),
+                        kind,
+                        name: name.clone(),
+                    });
+                }
                 resp.context_menu(|ui| {
+                    if ui.button("Open").clicked() {
+                        actions.push(SidebarAction::OpenObject {
+                            db: db.to_string(),
+                            kind,
+                            name: name.clone(),
+                        });
+                        ui.close();
+                    }
                     if ui.button("Copy name").clicked() {
                         actions.push(SidebarAction::CopyText(name.clone()));
                         ui.close();

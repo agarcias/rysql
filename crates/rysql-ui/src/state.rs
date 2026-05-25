@@ -2,9 +2,29 @@
 
 use std::collections::HashMap;
 
-use rysql_db::{DbHandle, SchemaObjects, ServerInfo};
+use rysql_db::{DbHandle, ObjectKind, SchemaObjects, ServerInfo};
 
 use crate::results::EditRequest;
+
+/// Stable identifier for a schema object across the UI: kind + db + name.
+/// Used as the key for `RysqlApp::objects` and the discriminator carried by
+/// `DockTab::Object`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectKey {
+    pub kind: ObjectKind,
+    pub db: String,
+    pub name: String,
+}
+
+impl ObjectKey {
+    pub fn new(kind: ObjectKind, db: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            db: db.into(),
+            name: name.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub enum LoadState<T> {

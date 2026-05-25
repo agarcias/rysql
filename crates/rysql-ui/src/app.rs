@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, Style};
@@ -7,6 +7,7 @@ use rysql_core::{
     SettingsStore, ThemeChoice,
 };
 use rysql_db::{build_pool, test_connection, DbActor, ObjectKind};
+use rysql_sql::Highlighter;
 use tokio::task::AbortHandle;
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
@@ -14,13 +15,16 @@ use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, Test
 use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
 use crate::history_view::{self, HistoryAction, HistoryView};
+use crate::object_view::{ObjectAction, ObjectViewState};
 #[allow(unused_imports)]
 use crate::results::EditRequest;
 use crate::results::{
     self, EditCellState, EditDialogChoice, ExportFormat, ResultTab, ResultsAction, ResultsState,
 };
 use crate::sidebar::{self, SidebarAction, SidebarInput};
-use crate::state::{ActiveConnection, ConfirmAction, LoadState, PendingExec, SchemaState};
+use crate::state::{
+    ActiveConnection, ConfirmAction, LoadState, ObjectKey, PendingExec, SchemaState,
+};
 
 pub struct RysqlApp {
     bridge: Bridge,
@@ -36,6 +40,10 @@ pub struct RysqlApp {
     editor: EditorState,
     dock: DockState<DockTab>,
     results: ResultsState,
+    objects: HashMap<ObjectKey, ObjectViewState>,
+    /// Dedicated highlighter for the Source subtab so the editor's
+    /// highlighter can be borrowed independently each frame.
+    source_highlighter: Highlighter,
     settings: AppSettings,
     settings_store: SettingsStore,
     history_store: HistoryStore,
@@ -92,6 +100,8 @@ impl RysqlApp {
             editor,
             dock,
             results: ResultsState::default(),
+            objects: HashMap::new(),
+            source_highlighter: Highlighter::new_dark(),
             settings,
             settings_store,
             history_store,
@@ -240,9 +250,8 @@ impl RysqlApp {
                             self.fetch_primary_key(tab_id, target.db.clone(), target.table.clone());
                             tab.editable = Some(target);
                         }
-                        let evicted = self.results.push(tab);
-                        if let Some(evicted_id) = evicted {
-                            self.remove_results_dock_tab(evicted_id);
+                        if let Some(evicted_id) = self.results.push(tab) {
+                            self.cleanup_evicted_result_tab(evicted_id);
                         }
                         self.dock.push_to_focused_leaf(DockTab::Results { tab_id });
                     }
@@ -296,6 +305,106 @@ impl RysqlApp {
                 }
                 UiEvent::StreamFinished => {
                     self.in_flight_query = None;
+                }
+                UiEvent::ObjectColumnsLoaded {
+                    profile,
+                    key,
+                    result,
+                } => {
+                    if self.is_active_profile(&profile) {
+                        if let Some(state) = self.objects.get_mut(&key) {
+                            state.columns = match result {
+                                Ok(v) => LoadState::Loaded(v),
+                                Err(e) => LoadState::Error(e),
+                            };
+                        }
+                    }
+                }
+                UiEvent::ObjectIndexesLoaded {
+                    profile,
+                    key,
+                    result,
+                } => {
+                    if self.is_active_profile(&profile) {
+                        if let Some(state) = self.objects.get_mut(&key) {
+                            state.indexes = match result {
+                                Ok(v) => LoadState::Loaded(v),
+                                Err(e) => LoadState::Error(e),
+                            };
+                        }
+                    }
+                }
+                UiEvent::ObjectForeignKeysLoaded {
+                    profile,
+                    key,
+                    result,
+                } => {
+                    if self.is_active_profile(&profile) {
+                        if let Some(state) = self.objects.get_mut(&key) {
+                            state.foreign_keys = match result {
+                                Ok(v) => LoadState::Loaded(v),
+                                Err(e) => LoadState::Error(e),
+                            };
+                        }
+                    }
+                }
+                UiEvent::ObjectSourceLoaded {
+                    profile,
+                    key,
+                    result,
+                } => {
+                    if self.is_active_profile(&profile) {
+                        if let Some(state) = self.objects.get_mut(&key) {
+                            state.source = match result {
+                                Ok(v) => LoadState::Loaded(v),
+                                Err(e) => LoadState::Error(e),
+                            };
+                        }
+                    }
+                }
+                UiEvent::ObjectDataLoaded {
+                    profile,
+                    key,
+                    label,
+                    sql,
+                    page_size,
+                    result,
+                } => {
+                    if !self.is_active_profile(&profile) {
+                        continue;
+                    }
+                    match result {
+                        Err(e) => {
+                            if let Some(state) = self.objects.get_mut(&key) {
+                                state.data = LoadState::Error(e);
+                            }
+                        }
+                        Ok(qr) => {
+                            let tab_id = self.results.next_tab_id();
+                            let row_count = qr.rows.len() as u64;
+                            let mut tab = ResultTab::new(tab_id, label, sql, qr);
+                            tab.page_size = page_size;
+                            tab.has_more = row_count >= page_size && page_size > 0;
+                            if let Some(target) = tab.detect_single_table() {
+                                self.fetch_primary_key(
+                                    tab_id,
+                                    target.db.clone(),
+                                    target.table.clone(),
+                                );
+                                tab.editable = Some(target);
+                            }
+                            if let Some(evicted_id) = self.results.push(tab) {
+                                self.cleanup_evicted_result_tab(evicted_id);
+                            }
+                            if let Some(state) = self.objects.get_mut(&key) {
+                                state.data = LoadState::Loaded(tab_id);
+                            } else {
+                                // Object tab was closed before the data
+                                // landed; drop the orphan result.
+                                self.results.remove_by_id(tab_id);
+                            }
+                        }
+                    }
                 }
                 UiEvent::CellEdited {
                     profile,
@@ -668,6 +777,16 @@ impl RysqlApp {
                 DockAction::CloseResultsTab(id) => {
                     self.results.remove_by_id(id);
                 }
+                DockAction::CloseObjectView(key) => {
+                    if let Some(state) = self.objects.remove(&key) {
+                        if let Some(data_id) = state.data_tab_id() {
+                            self.results.remove_by_id(data_id);
+                        }
+                    }
+                }
+                DockAction::ObjectRequest { key, action } => {
+                    self.dispatch_object_request(key, action);
+                }
                 DockAction::FocusedEditor(id) => {
                     if let Some(idx) = self.editor.buffer_index(id) {
                         self.editor.active = idx;
@@ -678,15 +797,153 @@ impl RysqlApp {
         self.ensure_at_least_one_editor_tab();
     }
 
-    /// Remove the dock tab pointing at the given result `tab_id`, if any.
-    /// Used when `ResultsState::push` evicts an old tab past the cap.
-    fn remove_results_dock_tab(&mut self, tab_id: u64) {
+    fn dispatch_object_request(&mut self, key: ObjectKey, action: ObjectAction) {
+        let Some(active) = self.active.as_ref() else {
+            // No live connection: mark every load as a friendly error so the
+            // subtab doesn't spin forever.
+            if let Some(state) = self.objects.get_mut(&key) {
+                let msg = "Not connected".to_string();
+                match action {
+                    ObjectAction::LoadColumns => state.columns = LoadState::Error(msg),
+                    ObjectAction::LoadIndexes => state.indexes = LoadState::Error(msg),
+                    ObjectAction::LoadForeignKeys => state.foreign_keys = LoadState::Error(msg),
+                    ObjectAction::LoadSource => state.source = LoadState::Error(msg),
+                    ObjectAction::LoadData => state.data = LoadState::Error(msg),
+                }
+            }
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        let db = key.db.clone();
+        let name = key.name.clone();
+        let kind = key.kind;
+        match action {
+            ObjectAction::LoadColumns => {
+                let key = key.clone();
+                self.bridge.spawn(async move {
+                    let result = handle
+                        .list_columns(db, name)
+                        .await
+                        .map_err(|e| e.friendly());
+                    UiEvent::ObjectColumnsLoaded {
+                        profile,
+                        key,
+                        result,
+                    }
+                });
+            }
+            ObjectAction::LoadIndexes => {
+                let key = key.clone();
+                self.bridge.spawn(async move {
+                    let result = handle
+                        .list_indexes(db, name)
+                        .await
+                        .map_err(|e| e.friendly());
+                    UiEvent::ObjectIndexesLoaded {
+                        profile,
+                        key,
+                        result,
+                    }
+                });
+            }
+            ObjectAction::LoadForeignKeys => {
+                let key = key.clone();
+                self.bridge.spawn(async move {
+                    let result = handle
+                        .list_foreign_keys(db, name)
+                        .await
+                        .map_err(|e| e.friendly());
+                    UiEvent::ObjectForeignKeysLoaded {
+                        profile,
+                        key,
+                        result,
+                    }
+                });
+            }
+            ObjectAction::LoadSource => {
+                let key = key.clone();
+                self.bridge.spawn(async move {
+                    let result = handle
+                        .show_create(db, kind, name)
+                        .await
+                        .map_err(|e| e.friendly());
+                    UiEvent::ObjectSourceLoaded {
+                        profile,
+                        key,
+                        result,
+                    }
+                });
+            }
+            ObjectAction::LoadData => self.load_object_data(key),
+        }
+    }
+
+    /// Run `SELECT * FROM \`db\`.\`tbl\` LIMIT 1000` and route the result
+    /// into the Object view's Data subtab (NOT a new dock Results tab —
+    /// the grid lives inside the Object tab to avoid duplication).
+    fn load_object_data(&mut self, key: ObjectKey) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        let db = key.db.clone();
+        let name = key.name.clone();
+        let page_size = results::DEFAULT_PAGE_SIZE;
+        let qualified = format!("`{}`.`{}`", db.replace('`', "``"), name.replace('`', "``"));
+        let user_sql = format!("SELECT * FROM {qualified}");
+        let exec_sql = format!("SELECT * FROM {qualified} LIMIT {page_size}");
+        let event_key = key.clone();
+        self.bridge.spawn(async move {
+            let result = handle.query(exec_sql).await.map_err(|e| e.friendly());
+            UiEvent::ObjectDataLoaded {
+                profile,
+                key: event_key,
+                label: format!("{db}.{name}"),
+                sql: user_sql,
+                page_size,
+                result,
+            }
+        });
+    }
+
+    /// Run when `ResultsState::push` evicts an old tab past the cap: drop
+    /// the matching dock tab AND mark any Object-view Data subtab that was
+    /// backed by it as `NotLoaded` so the next visit re-fetches.
+    fn cleanup_evicted_result_tab(&mut self, tab_id: u64) {
         let target = self.dock.iter_all_tabs().find_map(|(path, tab)| {
             matches!(tab, DockTab::Results { tab_id: id } if *id == tab_id).then_some(path)
         });
         if let Some(path) = target {
             self.dock.remove_tab(path);
         }
+        for state in self.objects.values_mut() {
+            if state.data_tab_id() == Some(tab_id) {
+                state.data = LoadState::NotLoaded;
+            }
+        }
+    }
+
+    fn is_active_profile(&self, profile: &str) -> bool {
+        self.active.as_ref().map(|a| a.profile_name.as_str()) == Some(profile)
+    }
+
+    /// Open (or focus) the object inspector tab for `key`. If a tab already
+    /// exists in the dock, just bring it to the front; otherwise create the
+    /// backing [`ObjectViewState`] and push a new `DockTab::Object`.
+    fn focus_or_open_object(&mut self, key: ObjectKey) {
+        let existing = self.dock.iter_all_tabs().find_map(|(path, tab)| {
+            matches!(tab, DockTab::Object { key: k } if k == &key).then_some(path)
+        });
+        if let Some(path) = existing {
+            let _ = self.dock.set_active_tab(path);
+            return;
+        }
+        self.objects
+            .entry(key.clone())
+            .or_insert_with(|| ObjectViewState::new(key.kind, key.db.clone(), key.name.clone()));
+        self.dock.push_to_focused_leaf(DockTab::Object { key });
     }
 
     /// UX safety net: never let the user end up looking at an empty dock.
@@ -927,6 +1184,9 @@ impl RysqlApp {
                 SidebarAction::ShowCreate { db, kind, name } => {
                     self.show_create(db, kind, name);
                 }
+                SidebarAction::OpenObject { db, kind, name } => {
+                    self.focus_or_open_object(ObjectKey::new(kind, db, name));
+                }
                 SidebarAction::Confirm(action) => {
                     self.confirm = Some(action);
                     self.confirm_typed.clear();
@@ -1132,7 +1392,13 @@ impl eframe::App for RysqlApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().inner_margin(egui::Margin::same(0)))
             .show_inside(ui, |ui| {
-                let mut viewer = AppViewer::new(&mut self.editor, &mut self.results, &schema_names);
+                let mut viewer = AppViewer::new(
+                    &mut self.editor,
+                    &mut self.results,
+                    &mut self.objects,
+                    &mut self.source_highlighter,
+                    &schema_names,
+                );
                 DockArea::new(&mut self.dock)
                     .style(Style::from_egui(ui.style().as_ref()))
                     .show_close_buttons(true)

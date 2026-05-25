@@ -3,7 +3,12 @@
 use std::future::Future;
 
 use eframe::egui;
-use rysql_db::{DbHandle, ExecOutcome, QueryResult, SchemaObjects, ServerInfo};
+use rysql_db::{
+    ColumnInfo, DbHandle, ExecOutcome, ForeignKeyInfo, IndexInfo, QueryResult, SchemaObjects,
+    ServerInfo,
+};
+
+use crate::state::ObjectKey;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -73,6 +78,38 @@ pub enum UiEvent {
     /// because the stream emitted everything it had). The app uses this to
     /// hide the running indicator and clear its abort handle.
     StreamFinished,
+    ObjectColumnsLoaded {
+        profile: String,
+        key: ObjectKey,
+        result: Result<Vec<ColumnInfo>, String>,
+    },
+    ObjectIndexesLoaded {
+        profile: String,
+        key: ObjectKey,
+        result: Result<Vec<IndexInfo>, String>,
+    },
+    ObjectForeignKeysLoaded {
+        profile: String,
+        key: ObjectKey,
+        result: Result<Vec<ForeignKeyInfo>, String>,
+    },
+    ObjectSourceLoaded {
+        profile: String,
+        key: ObjectKey,
+        result: Result<String, String>,
+    },
+    /// Result of the auto-issued `SELECT * FROM db.name LIMIT 1000` for an
+    /// Object view's Data subtab. Distinct from `QueryResult` so the app
+    /// does NOT push an extra `DockTab::Results` for it — the grid is
+    /// rendered inside the Object tab.
+    ObjectDataLoaded {
+        profile: String,
+        key: ObjectKey,
+        label: String,
+        sql: String,
+        page_size: u64,
+        result: Result<QueryResult, String>,
+    },
 }
 
 #[derive(Debug, Clone)]

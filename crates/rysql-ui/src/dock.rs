@@ -1,17 +1,20 @@
 //! `egui_dock` glue: the [`DockTab`] enum is the discriminator for every tab
 //! that lives in the central dock area; [`AppViewer`] is a thin
 //! [`egui_dock::TabViewer`] adapter that delegates rendering to the
-//! per-module renderers ([`crate::editor`], [`crate::results`]) and collects
-//! [`DockAction`] / [`ResultsAction`] intents that the caller applies after
-//! the dock has been rendered.
-//!
-//! The `Object` tab variant lands on Day 3 per `docs/dock-layout-plan.md`.
+//! per-module renderers ([`crate::editor`], [`crate::results`],
+//! [`crate::object_view`]) and collects [`DockAction`] / [`ResultsAction`]
+//! intents that the caller applies after the dock has been rendered.
+
+use std::collections::HashMap;
 
 use eframe::egui;
 use egui_dock::{tab_viewer::OnCloseResponse, TabViewer};
+use rysql_sql::Highlighter;
 
 use crate::editor::{self, EditorContext, EditorState};
+use crate::object_view::{self, ObjectAction, ObjectViewState};
 use crate::results::{self, ExportFormat, ResultsAction, ResultsState};
+use crate::state::ObjectKey;
 
 /// Discriminator for a tab living in the central [`egui_dock::DockState`].
 ///
@@ -25,6 +28,9 @@ pub enum DockTab {
     /// Result set tab backed by [`crate::results::ResultsState::tabs`] keyed
     /// by `tab_id`.
     Results { tab_id: u64 },
+    /// Schema-object inspector backed by an
+    /// [`crate::object_view::ObjectViewState`] keyed by an [`ObjectKey`].
+    Object { key: ObjectKey },
 }
 
 /// Intent collected during a dock render frame, applied by `RysqlApp` once
@@ -35,6 +41,14 @@ pub enum DockAction {
     CloseEditorBuffer(u64),
     /// The user closed a result tab; free the result set.
     CloseResultsTab(u64),
+    /// The user closed an object inspector tab; free its
+    /// [`ObjectViewState`] and any embedded data result.
+    CloseObjectView(ObjectKey),
+    /// Loader intent forwarded from a rendered object view this frame.
+    ObjectRequest {
+        key: ObjectKey,
+        action: ObjectAction,
+    },
     /// The editor for this buffer is the one with keyboard focus this frame.
     FocusedEditor(u64),
 }
@@ -44,6 +58,8 @@ pub enum DockAction {
 pub struct AppViewer<'a> {
     pub editor: &'a mut EditorState,
     pub results: &'a mut ResultsState,
+    pub objects: &'a mut HashMap<ObjectKey, ObjectViewState>,
+    pub source_highlighter: &'a mut Highlighter,
     pub schema_names: &'a [String],
     pub actions: Vec<DockAction>,
     pub results_actions: Vec<ResultsAction>,
@@ -53,11 +69,15 @@ impl<'a> AppViewer<'a> {
     pub fn new(
         editor: &'a mut EditorState,
         results: &'a mut ResultsState,
+        objects: &'a mut HashMap<ObjectKey, ObjectViewState>,
+        source_highlighter: &'a mut Highlighter,
         schema_names: &'a [String],
     ) -> Self {
         Self {
             editor,
             results,
+            objects,
+            source_highlighter,
             schema_names,
             actions: Vec::new(),
             results_actions: Vec::new(),
@@ -93,6 +113,7 @@ impl TabViewer for AppViewer<'_> {
                     .unwrap_or_else(|| format!("results #{tab_id}"));
                 label.into()
             }
+            DockTab::Object { key } => format!("{}.{}", key.db, key.name).into(),
         }
     }
 
@@ -100,6 +121,7 @@ impl TabViewer for AppViewer<'_> {
         match tab {
             DockTab::SqlEditor { buffer_id } => egui::Id::new(("dock-tab-editor", *buffer_id)),
             DockTab::Results { tab_id } => egui::Id::new(("dock-tab-results", *tab_id)),
+            DockTab::Object { key } => egui::Id::new(("dock-tab-object", key)),
         }
     }
 
@@ -116,6 +138,31 @@ impl TabViewer for AppViewer<'_> {
             }
             DockTab::Results { tab_id } => {
                 results::render_one(ui, self.results, *tab_id, &mut self.results_actions);
+            }
+            DockTab::Object { key } => {
+                if let Some(state) = self.objects.get_mut(key) {
+                    let intents = object_view::render(
+                        ui,
+                        state,
+                        self.results,
+                        self.source_highlighter,
+                        &mut self.results_actions,
+                    );
+                    for action in intents {
+                        self.actions.push(DockAction::ObjectRequest {
+                            key: key.clone(),
+                            action,
+                        });
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Object `{}.{}` is no longer available.",
+                            key.db, key.name
+                        ))
+                        .weak(),
+                    );
+                }
             }
         }
     }
@@ -146,6 +193,9 @@ impl TabViewer for AppViewer<'_> {
             }
             DockTab::Results { tab_id } => {
                 self.actions.push(DockAction::CloseResultsTab(*tab_id));
+            }
+            DockTab::Object { key } => {
+                self.actions.push(DockAction::CloseObjectView(key.clone()));
             }
         }
         OnCloseResponse::Close

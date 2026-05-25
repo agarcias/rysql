@@ -8,7 +8,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::query::{self, QueryResult};
-use crate::schema::{self, ObjectKind, SchemaObjects};
+use crate::schema::{self, ColumnInfo, ForeignKeyInfo, IndexInfo, ObjectKind, SchemaObjects};
 
 #[derive(Debug, Error)]
 pub enum ActorError {
@@ -75,6 +75,21 @@ enum DbCommand {
         table: String,
         reply: Reply<Vec<String>>,
     },
+    ListColumns {
+        db: String,
+        table: String,
+        reply: Reply<Vec<ColumnInfo>>,
+    },
+    ListIndexes {
+        db: String,
+        table: String,
+        reply: Reply<Vec<IndexInfo>>,
+    },
+    ListForeignKeys {
+        db: String,
+        table: String,
+        reply: Reply<Vec<ForeignKeyInfo>>,
+    },
     Shutdown,
 }
 
@@ -140,6 +155,33 @@ impl DbHandle {
             .await
     }
 
+    pub async fn list_columns(
+        &self,
+        db: String,
+        table: String,
+    ) -> Result<Vec<ColumnInfo>, ActorError> {
+        self.request(|reply| DbCommand::ListColumns { db, table, reply })
+            .await
+    }
+
+    pub async fn list_indexes(
+        &self,
+        db: String,
+        table: String,
+    ) -> Result<Vec<IndexInfo>, ActorError> {
+        self.request(|reply| DbCommand::ListIndexes { db, table, reply })
+            .await
+    }
+
+    pub async fn list_foreign_keys(
+        &self,
+        db: String,
+        table: String,
+    ) -> Result<Vec<ForeignKeyInfo>, ActorError> {
+        self.request(|reply| DbCommand::ListForeignKeys { db, table, reply })
+            .await
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(DbCommand::Shutdown);
     }
@@ -190,6 +232,15 @@ impl DbActor {
                 }
                 DbCommand::PrimaryKey { db, table, reply } => {
                     let _ = reply.send(schema::primary_key_columns(&self.pool, &db, &table).await);
+                }
+                DbCommand::ListColumns { db, table, reply } => {
+                    let _ = reply.send(schema::list_columns(&self.pool, &db, &table).await);
+                }
+                DbCommand::ListIndexes { db, table, reply } => {
+                    let _ = reply.send(schema::list_indexes(&self.pool, &db, &table).await);
+                }
+                DbCommand::ListForeignKeys { db, table, reply } => {
+                    let _ = reply.send(schema::list_foreign_keys(&self.pool, &db, &table).await);
                 }
                 DbCommand::Shutdown => break,
             }
