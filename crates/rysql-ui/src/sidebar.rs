@@ -32,24 +32,47 @@ pub struct SidebarInput<'a> {
     pub profiles: &'a [ConnectionProfile],
     pub active: Option<&'a ActiveConnection>,
     pub in_flight: &'a std::collections::HashSet<String>,
+    /// Substring filter mutated in place by the schema-tree search input.
+    /// Empty means "show everything".
+    pub filter: &'a mut String,
 }
 
 pub fn render(ui: &mut egui::Ui, input: SidebarInput<'_>) -> Vec<SidebarAction> {
     let mut actions = Vec::new();
+    let SidebarInput {
+        profiles,
+        active,
+        in_flight,
+        filter,
+    } = input;
     egui::ScrollArea::vertical().show(ui, |ui| {
-        connections_section(ui, &input, &mut actions);
+        let conn_input = ConnectionsInput {
+            profiles,
+            active,
+            in_flight,
+        };
+        connections_section(ui, &conn_input, &mut actions);
         ui.add_space(8.0);
-        if let Some(active) = input.active {
+        if let Some(active) = active {
             ui.separator();
-            schema_section(ui, active, &mut actions);
+            schema_section(ui, active, filter, &mut actions);
         }
     });
     actions
 }
 
+/// Subset of [`SidebarInput`] needed by `connections_section`; pulled
+/// out so the function signature stays the same as before the filter
+/// addition.
+struct ConnectionsInput<'a> {
+    profiles: &'a [ConnectionProfile],
+    active: Option<&'a ActiveConnection>,
+    in_flight: &'a std::collections::HashSet<String>,
+}
+
 fn connections_section(
     ui: &mut egui::Ui,
-    input: &SidebarInput<'_>,
+    input: &ConnectionsInput<'_>,
     actions: &mut Vec<SidebarAction>,
 ) {
     ui.horizontal(|ui| {
@@ -132,7 +155,12 @@ fn connections_section(
     }
 }
 
-fn schema_section(ui: &mut egui::Ui, active: &ActiveConnection, actions: &mut Vec<SidebarAction>) {
+fn schema_section(
+    ui: &mut egui::Ui,
+    active: &ActiveConnection,
+    filter: &mut String,
+    actions: &mut Vec<SidebarAction>,
+) {
     ui.horizontal(|ui| {
         ui.heading("Schema");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -150,6 +178,26 @@ fn schema_section(ui: &mut egui::Ui, active: &ActiveConnection, actions: &mut Ve
             .weak()
             .small(),
     );
+
+    // Filter input — substring match against DB names and object names.
+    // Empty → existing render path; non-empty → flat filtered view.
+    //
+    // We compute the input's `desired_width` from the row's currently
+    // available width instead of asking for `INFINITY`. Otherwise the
+    // request propagates up to the `SidePanel` and grows the whole
+    // sidebar to fit the (effectively unbounded) request.
+    ui.horizontal(|ui| {
+        let clear_reserved = if filter.is_empty() { 0.0 } else { 28.0 };
+        let avail = (ui.available_width() - clear_reserved).max(40.0);
+        ui.add(
+            egui::TextEdit::singleline(filter)
+                .hint_text("Filter…")
+                .desired_width(avail),
+        );
+        if !filter.is_empty() && ui.small_button("×").on_hover_text("Clear filter").clicked() {
+            filter.clear();
+        }
+    });
     ui.separator();
 
     match &active.schema.databases {
@@ -172,11 +220,181 @@ fn schema_section(ui: &mut egui::Ui, active: &ActiveConnection, actions: &mut Ve
             }
         }
         LoadState::Loaded(dbs) => {
-            for db in dbs {
-                render_db_node(ui, active, db, actions);
+            let needle = filter.trim().to_ascii_lowercase();
+            if needle.is_empty() {
+                for db in dbs {
+                    render_db_node(ui, active, db, actions);
+                }
+            } else {
+                let mut any_match = false;
+                for db in dbs {
+                    if render_db_filtered(ui, active, db, &needle, actions) {
+                        any_match = true;
+                    }
+                }
+                if !any_match {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("(no matches)").weak().italics().small());
+                }
             }
         }
     }
+}
+
+/// Render a database node when the filter is active. Returns `true` if
+/// anything was rendered (DB name match OR ≥ 1 object name match), so
+/// the caller can show a "(no matches)" hint when nothing matched.
+fn render_db_filtered(
+    ui: &mut egui::Ui,
+    active: &ActiveConnection,
+    db: &str,
+    needle: &str,
+    actions: &mut Vec<SidebarAction>,
+) -> bool {
+    let db_match = db.to_ascii_lowercase().contains(needle);
+
+    // If the DB name itself matches, surface the full tree.
+    if db_match {
+        render_db_node(ui, active, db, actions);
+        return true;
+    }
+
+    let Some(LoadState::Loaded(objs)) = active.schema.objects.get(db) else {
+        // The DB's objects aren't loaded yet — we can't decide if any
+        // item matches. Skip silently; the user can expand the unfiltered
+        // tree to trigger the load.
+        return false;
+    };
+
+    let categories: &[(&str, ObjectKind, &[String])] = &[
+        ("Tables", ObjectKind::Table, objs.tables.as_slice()),
+        ("Views", ObjectKind::View, objs.views.as_slice()),
+        (
+            "Procedures",
+            ObjectKind::Procedure,
+            objs.procedures.as_slice(),
+        ),
+        ("Functions", ObjectKind::Function, objs.functions.as_slice()),
+        ("Triggers", ObjectKind::Trigger, objs.triggers.as_slice()),
+        ("Events", ObjectKind::Event, objs.events.as_slice()),
+    ];
+
+    let any_hit = categories.iter().any(|(_, _, items)| {
+        items
+            .iter()
+            .any(|n| n.to_ascii_lowercase().contains(needle))
+    });
+    if !any_hit {
+        return false;
+    }
+
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(format!("🗄 {db}")).strong());
+    for (label, kind, items) in categories {
+        let hits: Vec<&String> = items
+            .iter()
+            .filter(|n| n.to_ascii_lowercase().contains(needle))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        ui.label(
+            egui::RichText::new(format!("  {label} ({})", hits.len()))
+                .strong()
+                .small(),
+        );
+        for name in hits {
+            render_object_item(ui, db, *kind, name, actions);
+        }
+    }
+    true
+}
+
+/// Single schema-tree item rendering, shared between the collapsing
+/// `render_category` and the flat filtered view.
+fn render_object_item(
+    ui: &mut egui::Ui,
+    db: &str,
+    kind: ObjectKind,
+    name: &str,
+    actions: &mut Vec<SidebarAction>,
+) {
+    let resp = ui.add(
+        egui::Label::new(format!("   {}  {}", kind.short_label(), name))
+            .selectable(false)
+            .truncate()
+            .show_tooltip_when_elided(true)
+            .sense(egui::Sense::click()),
+    );
+    if resp.double_clicked() {
+        actions.push(SidebarAction::OpenObject {
+            db: db.to_string(),
+            kind,
+            name: name.to_string(),
+        });
+    }
+    resp.context_menu(|ui| {
+        if ui.button("Open").clicked() {
+            actions.push(SidebarAction::OpenObject {
+                db: db.to_string(),
+                kind,
+                name: name.to_string(),
+            });
+            ui.close();
+        }
+        if ui.button("Copy name").clicked() {
+            actions.push(SidebarAction::CopyText(name.to_string()));
+            ui.close();
+        }
+        if ui.button("Copy CREATE statement").clicked() {
+            actions.push(SidebarAction::ShowCreate {
+                db: db.to_string(),
+                kind,
+                name: name.to_string(),
+            });
+            ui.close();
+        }
+        if matches!(kind, ObjectKind::Table) {
+            ui.separator();
+            if ui.button("Truncate…").clicked() {
+                actions.push(SidebarAction::Confirm(ConfirmAction {
+                    title: format!("Truncate `{name}`"),
+                    message: format!("This will remove ALL rows from `{db}`.`{name}`."),
+                    sql: format!(
+                        "TRUNCATE TABLE `{}`.`{}`",
+                        db.replace('`', "``"),
+                        name.replace('`', "``")
+                    ),
+                    kind: PendingExec::Truncate {
+                        db: db.to_string(),
+                        name: name.to_string(),
+                    },
+                }));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui
+            .button(format!("Drop {}…", kind.keyword().to_lowercase()))
+            .clicked()
+        {
+            actions.push(SidebarAction::Confirm(ConfirmAction {
+                title: format!("Drop {} `{}`", kind.keyword().to_lowercase(), name),
+                message: format!("This will permanently delete `{db}`.`{name}`."),
+                sql: format!(
+                    "DROP {} `{}`.`{}`",
+                    kind.keyword(),
+                    db.replace('`', "``"),
+                    name.replace('`', "``")
+                ),
+                kind: PendingExec::DropObject {
+                    db: db.to_string(),
+                    name: name.to_string(),
+                },
+            }));
+            ui.close();
+        }
+    });
 }
 
 fn render_db_node(
@@ -316,82 +534,7 @@ fn render_category(
         })
         .body(|ui| {
             for name in items {
-                let resp = ui.add(
-                    egui::Label::new(format!("{}  {}", kind.short_label(), name))
-                        .selectable(false)
-                        .truncate()
-                        .show_tooltip_when_elided(true)
-                        .sense(egui::Sense::click()),
-                );
-                if resp.double_clicked() {
-                    actions.push(SidebarAction::OpenObject {
-                        db: db.to_string(),
-                        kind,
-                        name: name.clone(),
-                    });
-                }
-                resp.context_menu(|ui| {
-                    if ui.button("Open").clicked() {
-                        actions.push(SidebarAction::OpenObject {
-                            db: db.to_string(),
-                            kind,
-                            name: name.clone(),
-                        });
-                        ui.close();
-                    }
-                    if ui.button("Copy name").clicked() {
-                        actions.push(SidebarAction::CopyText(name.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy CREATE statement").clicked() {
-                        actions.push(SidebarAction::ShowCreate {
-                            db: db.to_string(),
-                            kind,
-                            name: name.clone(),
-                        });
-                        ui.close();
-                    }
-                    if matches!(kind, ObjectKind::Table) {
-                        ui.separator();
-                        if ui.button("Truncate…").clicked() {
-                            actions.push(SidebarAction::Confirm(ConfirmAction {
-                                title: format!("Truncate `{name}`"),
-                                message: format!("This will remove ALL rows from `{db}`.`{name}`."),
-                                sql: format!(
-                                    "TRUNCATE TABLE `{}`.`{}`",
-                                    db.replace('`', "``"),
-                                    name.replace('`', "``")
-                                ),
-                                kind: PendingExec::Truncate {
-                                    db: db.to_string(),
-                                    name: name.clone(),
-                                },
-                            }));
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if ui
-                        .button(format!("Drop {}…", kind.keyword().to_lowercase()))
-                        .clicked()
-                    {
-                        actions.push(SidebarAction::Confirm(ConfirmAction {
-                            title: format!("Drop {} `{}`", kind.keyword().to_lowercase(), name),
-                            message: format!("This will permanently delete `{db}`.`{name}`."),
-                            sql: format!(
-                                "DROP {} `{}`.`{}`",
-                                kind.keyword(),
-                                db.replace('`', "``"),
-                                name.replace('`', "``")
-                            ),
-                            kind: PendingExec::DropObject {
-                                db: db.to_string(),
-                                name: name.clone(),
-                            },
-                        }));
-                        ui.close();
-                    }
-                });
+                render_object_item(ui, db, kind, name, actions);
             }
         });
 }

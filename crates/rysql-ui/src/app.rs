@@ -48,6 +48,10 @@ pub struct RysqlApp {
     source_highlighter: Highlighter,
     /// Open instance of the column add/modify modal (one at a time).
     column_edit_modal: Option<ColumnEditState>,
+    /// Substring filter applied to the schema sidebar. UI-side only —
+    /// persists across reconnects (lives on the app, not on
+    /// `ActiveConnection`).
+    schema_filter: String,
     settings: AppSettings,
     settings_store: SettingsStore,
     history_store: HistoryStore,
@@ -107,6 +111,7 @@ impl RysqlApp {
             objects: HashMap::new(),
             source_highlighter: Highlighter::new_dark(),
             column_edit_modal: None,
+            schema_filter: String::new(),
             settings,
             settings_store,
             history_store,
@@ -1978,12 +1983,19 @@ impl eframe::App for RysqlApp {
 
         egui::Panel::left("sidebar")
             .default_size(280.0)
+            // Defensive size bounds. With the sidebar's filter input now
+            // requesting only the currently-available width (not INFINITY),
+            // the panel won't auto-grow with content — these only matter
+            // when the user is dragging the divider.
+            .min_size(200.0)
+            .max_size(600.0)
             .resizable(true)
             .show_inside(ui, |ui| {
                 let input = SidebarInput {
                     profiles: &self.profiles,
                     active: self.active.as_ref(),
                     in_flight: &self.in_flight,
+                    filter: &mut self.schema_filter,
                 };
                 let actions = sidebar::render(ui, input);
                 self.apply_sidebar(&ctx, actions);
