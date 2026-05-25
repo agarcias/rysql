@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RySQL
+GenericName=Database Client
+Comment=GUI client for MySQL and MariaDB
+Exec=rysql %U
+Icon=rysql
+Terminal=false
+Categories=Development;Database;IDE;
+Keywords=SQL;MySQL;MariaDB;Database;Query;
+StartupWMClass=RySQL
+StartupNotify=true

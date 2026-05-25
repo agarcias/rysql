@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.rysql.RySQL</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>RySQL</name>
+  <summary>GUI client for MySQL and MariaDB</summary>
+  <description>
+    <p>
+      RySQL is a desktop SQL client for MySQL and MariaDB. It includes a tabbed
+      SQL editor with syntax highlighting and autocompletion, a schema browser,
+      a virtualized results grid with edit-in-place by primary key, query history
+      and per-statement cancellation.
+    </p>
+  </description>
+  <launchable type="desktop-id">rysql.desktop</launchable>
+  <url type="homepage">https://github.com/arongarcia/rysql</url>
+  <url type="bugtracker">https://github.com/arongarcia/rysql/issues</url>
+  <categories>
+    <category>Development</category>
+    <category>Database</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.6.0" date="2026-05-24"/>
+  </releases>
+</component>
