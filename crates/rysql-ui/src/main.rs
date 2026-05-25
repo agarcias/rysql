@@ -1,11 +1,12 @@
 use eframe::egui;
-use tracing_subscriber::EnvFilter;
 
 mod app;
 mod bridge;
 mod dialog;
 mod editor;
 mod fonts;
+mod history_view;
+mod logging;
 mod results;
 mod runtime;
 mod sidebar;
@@ -14,11 +15,7 @@ mod state;
 use app::RysqlApp;
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let _log_guard = logging::init();
 
     // Pre-warm the tokio runtime so it's ready when the first frame renders.
     let _ = runtime::handle();

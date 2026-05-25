@@ -18,6 +18,17 @@ pub enum ActorError {
     Sqlx(#[from] sqlx::Error),
 }
 
+impl ActorError {
+    /// Short, human-readable form. Use this for status-bar messages and
+    /// reserve `.to_string()` for logs and tooltips.
+    pub fn friendly(&self) -> String {
+        match self {
+            ActorError::Closed => "Connection was closed".into(),
+            ActorError::Sqlx(e) => crate::errors::friendly(e),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub version: String,

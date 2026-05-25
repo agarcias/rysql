@@ -8,8 +8,10 @@ description = "Core types, errors and DB-agnostic traits for RySQL."
 
 [dependencies]
 serde = { workspace = true }
+serde_json = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
 keyring = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

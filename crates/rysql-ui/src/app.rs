@@ -1,12 +1,17 @@
 use std::collections::HashSet;
 
 use eframe::egui;
-use rysql_core::{secret, store::ProfileStore, ConnectionProfile};
+use rysql_core::{
+    secret, store::ProfileStore, AppSettings, ConnectionProfile, HistoryEntry, HistoryStore,
+    SettingsStore, ThemeChoice,
+};
 use rysql_db::{build_pool, test_connection, DbActor, ObjectKind};
+use tokio::task::AbortHandle;
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::editor::{self, EditorAction, EditorState};
+use crate::history_view::{self, HistoryAction, HistoryView};
 #[allow(unused_imports)]
 use crate::results::EditRequest;
 use crate::results::{
@@ -28,12 +33,17 @@ pub struct RysqlApp {
     confirm_typed: String,
     editor: EditorState,
     results: ResultsState,
+    settings: AppSettings,
+    settings_store: SettingsStore,
+    history_store: HistoryStore,
+    history_view: HistoryView,
+    /// Abort handle for the currently running ad-hoc script, if any.
+    in_flight_query: Option<AbortHandle>,
 }
 
 impl RysqlApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_fonts(crate::fonts::definitions());
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let bridge = Bridge::new(crate::runtime::handle(), cc.egui_ctx.clone());
         let store = ProfileStore::locate().expect("locate config dir");
@@ -44,6 +54,13 @@ impl RysqlApp {
                 Vec::new()
             }
         };
+
+        let settings_store = SettingsStore::locate().expect("locate config dir");
+        let settings = settings_store.load().unwrap_or_default();
+        apply_theme(&cc.egui_ctx, settings.theme);
+
+        let history_store =
+            HistoryStore::locate(settings.history_limit.max(1)).expect("locate data dir");
 
         Self {
             bridge,
@@ -58,6 +75,11 @@ impl RysqlApp {
             confirm_typed: String::new(),
             editor: EditorState::default(),
             results: ResultsState::default(),
+            settings,
+            settings_store,
+            history_store,
+            history_view: HistoryView::default(),
+            in_flight_query: None,
         }
     }
 
@@ -149,7 +171,7 @@ impl RysqlApp {
                     if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
                         continue;
                     }
-                    match result {
+                    match &result {
                         Ok(out) => {
                             self.last_error = None;
                             self.last_info = Some(format!(
@@ -173,34 +195,35 @@ impl RysqlApp {
                     if self.active.as_ref().map(|a| a.profile_name.as_str()) != Some(&profile) {
                         continue;
                     }
-                    match result {
+                    let (success, summary) = match &result {
                         Ok(qr) => {
                             self.last_error = None;
-                            self.last_info = Some(format!(
+                            let msg = format!(
                                 "{} row(s) · {} col(s) · {:.1?}",
                                 qr.rows.len(),
                                 qr.columns.len(),
                                 qr.elapsed
-                            ));
-                            let tab_id = self.results.next_tab_id();
-                            let row_count = qr.rows.len() as u64;
-                            let mut tab = ResultTab::new(tab_id, label, sql, qr);
-                            tab.page_size = page_size;
-                            tab.has_more = row_count >= page_size && page_size > 0;
-                            // Detect single-table origin; if so, ask for PK columns.
-                            if let Some(target) = tab.detect_single_table() {
-                                self.fetch_primary_key(
-                                    tab_id,
-                                    target.db.clone(),
-                                    target.table.clone(),
-                                );
-                                tab.editable = Some(target);
-                            }
-                            self.results.push(tab);
+                            );
+                            self.last_info = Some(msg.clone());
+                            (true, msg)
                         }
                         Err(e) => {
                             self.last_error = Some(format!("Query failed: {e}"));
+                            (false, format!("Query failed: {e}"))
                         }
+                    };
+                    self.push_history(&profile, &sql, success, &summary);
+                    if let Ok(qr) = result {
+                        let tab_id = self.results.next_tab_id();
+                        let row_count = qr.rows.len() as u64;
+                        let mut tab = ResultTab::new(tab_id, label, sql, qr);
+                        tab.page_size = page_size;
+                        tab.has_more = row_count >= page_size && page_size > 0;
+                        if let Some(target) = tab.detect_single_table() {
+                            self.fetch_primary_key(tab_id, target.db.clone(), target.table.clone());
+                            tab.editable = Some(target);
+                        }
+                        self.results.push(tab);
                     }
                 }
                 UiEvent::PageAppended {
@@ -249,6 +272,9 @@ impl RysqlApp {
                             }
                         }
                     }
+                }
+                UiEvent::StreamFinished => {
+                    self.in_flight_query = None;
                 }
                 UiEvent::CellEdited {
                     profile,
@@ -342,7 +368,9 @@ impl RysqlApp {
         let handle = active.handle.clone();
         let page_size = results::DEFAULT_PAGE_SIZE;
 
-        self.bridge.spawn_stream(move |emitter| async move {
+        // Replace any previous in-flight stream so its abort handle is dropped.
+        self.in_flight_query = None;
+        let abort = self.bridge.spawn_stream(move |emitter| async move {
             for stmt in statements {
                 let label = sql_label(&stmt);
                 if rysql_sql::is_query_returning_rows(&stmt) {
@@ -352,7 +380,7 @@ impl RysqlApp {
                     } else {
                         rysql_sql::inject_pagination(&stmt, page_size, 0)
                     };
-                    let result = handle.query(exec_sql).await.map_err(|e| e.to_string());
+                    let result = handle.query(exec_sql).await.map_err(|e| e.friendly());
                     let is_err = result.is_err();
                     emitter.send(UiEvent::QueryResult {
                         profile: profile.clone(),
@@ -365,7 +393,7 @@ impl RysqlApp {
                         break;
                     }
                 } else {
-                    let result = handle.execute(stmt).await.map_err(|e| e.to_string());
+                    let result = handle.execute(stmt).await.map_err(|e| e.friendly());
                     let is_err = result.is_err();
                     emitter.send(UiEvent::ExecResult {
                         profile: profile.clone(),
@@ -378,6 +406,34 @@ impl RysqlApp {
                 }
             }
         });
+        self.in_flight_query = Some(abort);
+    }
+
+    fn push_history(&mut self, profile: &str, sql: &str, success: bool, summary: &str) {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let entry = HistoryEntry {
+            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            profile: profile.to_string(),
+            sql: trimmed.to_string(),
+            success,
+            summary: summary.to_string(),
+        };
+        if let Err(e) = self.history_store.push(entry) {
+            tracing::warn!(error = %e, "failed to append to history");
+        } else {
+            // Invalidate the cached view so the next open re-reads the file.
+            self.history_view.entries.clear();
+        }
+    }
+
+    fn cancel_in_flight(&mut self) {
+        if let Some(abort) = self.in_flight_query.take() {
+            abort.abort();
+            self.last_info = Some("Cancelled".into());
+        }
     }
 
     fn fetch_primary_key(&mut self, tab_id: u64, db: String, table: String) {
@@ -390,7 +446,7 @@ impl RysqlApp {
             let result = handle
                 .primary_key(db, table)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.friendly());
             UiEvent::PrimaryKey {
                 profile,
                 tab_id,
@@ -408,7 +464,7 @@ impl RysqlApp {
         let handle = active.handle.clone();
         let exec_sql = rysql_sql::inject_pagination(&sql, limit, offset);
         self.bridge.spawn(async move {
-            let result = handle.query(exec_sql).await.map_err(|e| e.to_string());
+            let result = handle.query(exec_sql).await.map_err(|e| e.friendly());
             UiEvent::PageAppended {
                 profile,
                 tab_id,
@@ -431,7 +487,7 @@ impl RysqlApp {
         let col = req.col;
         let new_value = req.new_value.clone();
         self.bridge.spawn(async move {
-            let result = handle.execute(sql).await.map_err(|e| e.to_string());
+            let result = handle.execute(sql).await.map_err(|e| e.friendly());
             UiEvent::CellEdited {
                 profile,
                 tab_id,
@@ -584,7 +640,7 @@ impl RysqlApp {
         self.bridge.spawn(async move {
             let result = test_connection(&profile, &password)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.friendly());
             UiEvent::TestResult {
                 profile: key,
                 result,
@@ -702,7 +758,7 @@ impl RysqlApp {
         let handle = active.handle.clone();
         active.schema.databases = LoadState::Loading;
         self.bridge.spawn(async move {
-            let result = handle.list_databases().await.map_err(|e| e.to_string());
+            let result = handle.list_databases().await.map_err(|e| e.friendly());
             UiEvent::DatabasesListed { profile, result }
         });
     }
@@ -722,7 +778,7 @@ impl RysqlApp {
             let result = handle
                 .list_objects(db_owned.clone())
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.friendly());
             UiEvent::ObjectsListed {
                 profile,
                 db: db_owned,
@@ -742,7 +798,7 @@ impl RysqlApp {
             let result = handle
                 .show_create(db, kind, name_clone.clone())
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.friendly());
             UiEvent::ShowCreate {
                 profile,
                 name: name_clone,
@@ -773,7 +829,7 @@ impl RysqlApp {
         };
         let sql = action.sql.clone();
         self.bridge.spawn(async move {
-            let result = handle.execute(sql).await.map_err(|e| e.to_string());
+            let result = handle.execute(sql).await.map_err(|e| e.friendly());
             UiEvent::ExecResult {
                 profile,
                 kind: exec_kind,
@@ -818,7 +874,12 @@ impl RysqlApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            egui::containers::menu::MenuButton::new("Edit").ui(ui, |_ui| {});
+            egui::containers::menu::MenuButton::new("Edit").ui(ui, |ui| {
+                if ui.button("History…").clicked() {
+                    self.open_history();
+                    ui.close();
+                }
+            });
             egui::containers::menu::MenuButton::new("View").ui(ui, |ui| {
                 let enabled = self.active.is_some();
                 if ui
@@ -827,6 +888,27 @@ impl RysqlApp {
                 {
                     self.fetch_databases();
                     ui.close();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Theme").weak().small());
+                let mut changed = false;
+                for (label, value) in [
+                    ("Follow system", ThemeChoice::System),
+                    ("Light", ThemeChoice::Light),
+                    ("Dark", ThemeChoice::Dark),
+                ] {
+                    if ui
+                        .selectable_value(&mut self.settings.theme, value, label)
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    apply_theme(ctx, self.settings.theme);
+                    if let Err(e) = self.settings_store.save(&self.settings) {
+                        tracing::warn!(error = %e, "failed to persist settings");
+                    }
                 }
             });
             egui::containers::menu::MenuButton::new("Help").ui(ui, |ui| {
@@ -837,7 +919,20 @@ impl RysqlApp {
         });
     }
 
-    fn render_status_bar(&self, ui: &mut egui::Ui) {
+    fn open_history(&mut self) {
+        match self.history_store.load() {
+            Ok(entries) => {
+                self.history_view.entries = entries;
+                self.history_view.open = true;
+            }
+            Err(e) => {
+                self.last_error = Some(format!("History: {e}"));
+            }
+        }
+    }
+
+    fn render_status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut cancel = false;
         ui.horizontal(|ui| {
             match &self.active {
                 Some(a) => {
@@ -852,7 +947,17 @@ impl RysqlApp {
                     ui.label("Disconnected");
                 }
             }
-            if let Some(err) = &self.last_error {
+            if self.in_flight_query.is_some() {
+                ui.separator();
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("Running…")
+                        .color(egui::Color32::from_rgb(0x8a, 0xb4, 0xf8)),
+                );
+                if ui.small_button("Cancel").clicked() {
+                    cancel = true;
+                }
+            } else if let Some(err) = &self.last_error {
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(0xe5, 0x73, 0x73), err);
             } else if let Some(info) = &self.last_info {
@@ -863,6 +968,9 @@ impl RysqlApp {
                 ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
             });
         });
+        if cancel {
+            self.cancel_in_flight();
+        }
     }
 
     fn render_dialog(&mut self, ctx: &egui::Context) {
@@ -975,6 +1083,7 @@ impl eframe::App for RysqlApp {
         self.apply_results_actions(&ctx, viewer_actions);
 
         self.render_edit_modal(&ctx);
+        self.render_history(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -982,7 +1091,42 @@ impl eframe::App for RysqlApp {
     }
 }
 
+fn apply_theme(ctx: &egui::Context, choice: ThemeChoice) {
+    let pref = match choice {
+        ThemeChoice::Dark => egui::ThemePreference::Dark,
+        ThemeChoice::Light => egui::ThemePreference::Light,
+        ThemeChoice::System => egui::ThemePreference::System,
+    };
+    ctx.set_theme(pref);
+}
+
 impl RysqlApp {
+    fn render_history(&mut self, ctx: &egui::Context) {
+        let action = history_view::render(ctx, &mut self.history_view);
+        match action {
+            HistoryAction::None => {}
+            HistoryAction::Close => {
+                self.history_view.open = false;
+            }
+            HistoryAction::LoadIntoEditor(sql) => {
+                self.editor.new_buffer();
+                if let Some(buf) = self.editor.buffers.get_mut(self.editor.active) {
+                    buf.text = sql;
+                    buf.dirty = true;
+                }
+                self.history_view.open = false;
+            }
+            HistoryAction::Clear => {
+                if let Err(e) = self.history_store.clear() {
+                    self.last_error = Some(format!("Clear history: {e}"));
+                } else {
+                    self.history_view.entries.clear();
+                    self.last_info = Some("History cleared".into());
+                }
+            }
+        }
+    }
+
     fn render_edit_modal(&mut self, ctx: &egui::Context) {
         let Some(mut state) = self.results.edit_modal.take() else {
             return;

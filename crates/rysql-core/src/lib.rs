@@ -3,8 +3,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod history;
 pub mod secret;
+pub mod settings;
 pub mod store;
+
+pub use history::{HistoryEntry, HistoryStore};
+pub use settings::{AppSettings, SettingsStore, ThemeChoice};
 
 #[derive(Debug, Error)]
 pub enum CoreError {

@@ -6,6 +6,7 @@ use eframe::egui;
 use rysql_db::{DbHandle, ExecOutcome, QueryResult, SchemaObjects, ServerInfo};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 #[derive(Debug)]
 pub enum UiEvent {
@@ -68,6 +69,10 @@ pub enum UiEvent {
         new_value: String,
         result: Result<ExecOutcome, String>,
     },
+    /// Sent by `spawn_stream` after the streaming task finishes (normally or
+    /// because the stream emitted everything it had). The app uses this to
+    /// hide the running indicator and clear its abort handle.
+    StreamFinished,
 }
 
 #[derive(Debug, Clone)]
@@ -122,10 +127,9 @@ impl Bridge {
     }
 
     /// Spawn a task that may emit multiple [`UiEvent`]s over its lifetime.
-    /// Each `send` on the provided emitter triggers a repaint, so the UI
-    /// reacts to per-statement results in a multi-statement script as they
-    /// arrive.
-    pub fn spawn_stream<F, Fut>(&self, f: F)
+    /// Each `send` on the provided emitter triggers a repaint. Returns an
+    /// [`AbortHandle`] the caller can keep to cancel the in-flight task.
+    pub fn spawn_stream<F, Fut>(&self, f: F) -> AbortHandle
     where
         F: FnOnce(EventEmitter) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -134,9 +138,14 @@ impl Bridge {
             tx: self.tx.clone(),
             ctx: self.ctx.clone(),
         };
-        self.rt.spawn(async move {
+        let finish_tx = self.tx.clone();
+        let finish_ctx = self.ctx.clone();
+        let handle = self.rt.spawn(async move {
             f(emitter).await;
+            let _ = finish_tx.send(UiEvent::StreamFinished);
+            finish_ctx.request_repaint();
         });
+        handle.abort_handle()
     }
 
     pub fn drain(&mut self) -> Vec<UiEvent> {
