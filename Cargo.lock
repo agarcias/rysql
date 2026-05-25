@@ -3005,7 +3005,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rysql-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "directories",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "rysql-db"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rysql-core",
  "serde",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "rysql-sql"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "sqlformat",
  "syntect",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "rysql-ui"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
