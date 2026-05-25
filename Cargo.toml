@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rysql-core",
+    "crates/rysql-db",
+    "crates/rysql-sql",
+    "crates/rysql-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["RySQL contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arongarcia/rysql"
+homepage = "https://github.com/arongarcia/rysql"
+readme = "README.md"
+
+[workspace.dependencies]
+rysql-core = { path = "crates/rysql-core" }
+rysql-db = { path = "crates/rysql-db" }
+rysql-sql = { path = "crates/rysql-sql" }
+
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.34"
+egui_dock = "0.19"
+egui_extras = { version = "0.34", features = ["all_loaders"] }
+
+sqlx = { version = "0.9", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring", "chrono", "json", "macros"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "6"
+keyring = "4"
+
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+sqlformat = "0.5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

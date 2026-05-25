@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local override of CI/env config
+.env
+.env.*
+!.env.example
+
+# Local secrets / connection caches
+/.rysql-local/

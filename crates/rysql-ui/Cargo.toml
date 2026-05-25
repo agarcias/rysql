@@ -1,0 +1,28 @@
+[package]
+name = "rysql-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RySQL desktop application (egui/eframe)."
+default-run = "rysql"
+
+[[bin]]
+name = "rysql"
+path = "src/main.rs"
+
+[dependencies]
+rysql-core = { workspace = true }
+rysql-db = { workspace = true }
+rysql-sql = { workspace = true }
+
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_dock = { workspace = true }
+egui_extras = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
