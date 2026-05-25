@@ -5,6 +5,8 @@ mod app;
 mod bridge;
 mod dialog;
 mod runtime;
+mod sidebar;
+mod state;
 
 use app::RysqlApp;
 

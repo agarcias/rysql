@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use eframe::egui;
-use rysql_db::{DbHandle, ServerInfo};
+use rysql_db::{DbHandle, ExecOutcome, SchemaObjects, ServerInfo};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -22,6 +22,33 @@ pub enum UiEvent {
         profile: String,
         error: String,
     },
+    DatabasesListed {
+        profile: String,
+        result: Result<Vec<String>, String>,
+    },
+    ObjectsListed {
+        profile: String,
+        db: String,
+        result: Result<SchemaObjects, String>,
+    },
+    ShowCreate {
+        profile: String,
+        name: String,
+        result: Result<String, String>,
+    },
+    ExecResult {
+        profile: String,
+        kind: ExecKind,
+        result: Result<ExecOutcome, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ExecKind {
+    /// Object inside a database changed; invalidate that db's cached objects.
+    AlteredDb(String),
+    /// A database was dropped; refresh the full database list.
+    DroppedDatabase,
 }
 
 pub struct Bridge {

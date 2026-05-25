@@ -1,7 +1,9 @@
-//! "New connection" modal dialog.
+//! Modal dialogs: "New connection" and destructive-action confirmation.
 
 use eframe::egui;
 use rysql_core::{ConnectionProfile, TlsMode};
+
+use crate::state::ConfirmAction;
 
 #[derive(Debug, Clone)]
 pub struct NewConnectionDialog {
@@ -184,4 +186,83 @@ pub fn show(ctx: &egui::Context, state: &mut NewConnectionDialog) -> DialogActio
         });
     });
     action
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ConfirmChoice {
+    None,
+    Confirm,
+    Cancel,
+}
+
+/// Renders the destructive-action confirmation modal. The caller passes the
+/// pending action; the user must type the object name to enable Confirm.
+pub fn show_confirm(
+    ctx: &egui::Context,
+    action: &ConfirmAction,
+    typed: &mut String,
+) -> ConfirmChoice {
+    let mut choice = ConfirmChoice::None;
+    egui::Modal::new(egui::Id::new("confirm-modal")).show(ctx, |ui| {
+        ui.set_min_width(440.0);
+        ui.heading(&action.title);
+        ui.add_space(8.0);
+        ui.label(&action.message);
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("SQL to be executed:").weak().small());
+        let mut sql = action.sql.clone();
+        ui.add(
+            egui::TextEdit::multiline(&mut sql)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .interactive(false)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(8.0);
+
+        let target = confirm_target(action);
+        ui.label(format!(
+            "Type the {} name to confirm:",
+            confirm_target_label(action)
+        ));
+        ui.label(egui::RichText::new(&target).strong().monospace());
+        ui.add(egui::TextEdit::singleline(typed).desired_width(f32::INFINITY));
+        ui.add_space(8.0);
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                choice = ConfirmChoice::Cancel;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enabled = typed.trim() == target;
+                let btn = egui::Button::new(
+                    egui::RichText::new("Confirm").color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
+                );
+                if ui.add_enabled(enabled, btn).clicked() {
+                    choice = ConfirmChoice::Confirm;
+                }
+            });
+        });
+    });
+    choice
+}
+
+fn confirm_target(action: &ConfirmAction) -> String {
+    use crate::state::PendingExec;
+    match &action.kind {
+        PendingExec::DropObject { name, .. } => name.clone(),
+        PendingExec::Truncate { name, .. } => name.clone(),
+        PendingExec::DropDatabase { db } => db.clone(),
+    }
+}
+
+fn confirm_target_label(action: &ConfirmAction) -> &'static str {
+    use crate::state::PendingExec;
+    match action.kind {
+        PendingExec::DropObject { .. } => "object",
+        PendingExec::Truncate { .. } => "table",
+        PendingExec::DropDatabase { .. } => "database",
+    }
 }
