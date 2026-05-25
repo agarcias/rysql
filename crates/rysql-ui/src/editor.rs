@@ -184,7 +184,12 @@ fn consume_autocomplete_keys(ctx: &egui::Context) -> Option<AcKey> {
             Some(AcKey::Down)
         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
             Some(AcKey::Up)
-        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+            // Accept on Enter when the popup is open. Because we consume
+            // the key here it never reaches the `TextEdit`, so no stray
+            // newline is inserted. Tab falls back to its native role
+            // (focus traversal) and Ctrl+Enter / Ctrl+Shift+Enter still
+            // run queries because both carry a modifier.
             Some(AcKey::Accept)
         } else {
             None
@@ -412,7 +417,7 @@ fn render_autocomplete_popup(ctx: &egui::Context, ac: &AutocompleteState) {
                     }
                     ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new("Tab to accept · Esc to dismiss · ↑↓ to navigate")
+                        egui::RichText::new("Enter to accept · Esc to dismiss · ↑↓ to navigate")
                             .weak()
                             .small(),
                     );
