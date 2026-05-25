@@ -6,6 +6,7 @@ use rysql_db::{build_pool, test_connection, DbActor, ObjectKind};
 
 use crate::bridge::{Bridge, ExecKind, UiEvent};
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
+use crate::editor::{self, EditorAction, EditorState};
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{ActiveConnection, ConfirmAction, LoadState, PendingExec, SchemaState};
 
@@ -20,10 +21,12 @@ pub struct RysqlApp {
     last_info: Option<String>,
     confirm: Option<ConfirmAction>,
     confirm_typed: String,
+    editor: EditorState,
 }
 
 impl RysqlApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_fonts(crate::fonts::definitions());
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let bridge = Bridge::new(crate::runtime::handle(), cc.egui_ctx.clone());
@@ -47,6 +50,7 @@ impl RysqlApp {
             last_info: None,
             confirm: None,
             confirm_typed: String::new(),
+            editor: EditorState::default(),
         }
     }
 
@@ -167,6 +171,77 @@ impl RysqlApp {
             ExecKind::AlteredDb(db) => {
                 if let Some(active) = self.active.as_mut() {
                     active.schema.objects.remove(db);
+                }
+            }
+            ExecKind::Adhoc => {}
+        }
+    }
+
+    fn run_adhoc(&mut self, sql: String) {
+        let Some(active) = self.active.as_ref() else {
+            self.last_error = Some("Not connected".into());
+            return;
+        };
+        let profile = active.profile_name.clone();
+        let handle = active.handle.clone();
+        self.bridge.spawn(async move {
+            let result = handle.execute(sql).await.map_err(|e| e.to_string());
+            UiEvent::ExecResult {
+                profile,
+                kind: ExecKind::Adhoc,
+                result,
+            }
+        });
+    }
+
+    fn collect_schema_names(&self) -> Vec<String> {
+        let Some(active) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for state in active.schema.objects.values() {
+            if let LoadState::Loaded(objs) = state {
+                out.extend(objs.tables.iter().cloned());
+                out.extend(objs.views.iter().cloned());
+                out.extend(objs.procedures.iter().cloned());
+                out.extend(objs.functions.iter().cloned());
+                out.extend(objs.triggers.iter().cloned());
+                out.extend(objs.events.iter().cloned());
+            }
+        }
+        if let LoadState::Loaded(dbs) = &active.schema.databases {
+            out.extend(dbs.iter().cloned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn apply_editor_actions(&mut self, actions: Vec<EditorAction>) {
+        for action in actions {
+            match action {
+                EditorAction::NewTab => {
+                    self.editor.new_buffer();
+                }
+                EditorAction::SelectTab(idx) => {
+                    if idx < self.editor.buffers.len() {
+                        self.editor.active = idx;
+                    }
+                }
+                EditorAction::CloseTab(mut idx) => {
+                    if idx == usize::MAX {
+                        idx = self.editor.active;
+                    }
+                    self.editor.close_buffer(idx);
+                }
+                EditorAction::Format => editor::apply_format(&mut self.editor),
+                EditorAction::ToggleComment => editor::apply_toggle_comment(&mut self.editor),
+                EditorAction::Execute(arg) => {
+                    if let Some(sql) = editor::resolve_execute(&self.editor, &arg, None) {
+                        self.run_adhoc(sql);
+                    } else {
+                        self.last_info = Some("Nothing to execute".into());
+                    }
                 }
             }
         }
@@ -526,13 +601,19 @@ impl eframe::App for RysqlApp {
                 self.apply_sidebar(&ctx, actions);
             });
 
+        let shortcut_actions =
+            editor::handle_shortcuts(&ctx, self.confirm.is_none() && self.dialog.is_none());
+
+        let schema_names = self.collect_schema_names();
+        let mut editor_actions = Vec::new();
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
-                ui.heading("RySQL");
-                ui.label("Pick a connection on the left, or create a new one.");
-            });
+            let ec = editor::EditorContext {
+                schema_names: &schema_names,
+            };
+            editor_actions = editor::render(ui, &mut self.editor, ec);
         });
+        editor_actions.extend(shortcut_actions);
+        self.apply_editor_actions(editor_actions);
 
         self.render_dialog(&ctx);
         self.render_confirm(&ctx);

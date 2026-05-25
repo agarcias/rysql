@@ -49,6 +49,8 @@ pub enum ExecKind {
     AlteredDb(String),
     /// A database was dropped; refresh the full database list.
     DroppedDatabase,
+    /// Ad-hoc query from the SQL editor — no cache invalidation needed.
+    Adhoc,
 }
 
 pub struct Bridge {

@@ -4,6 +4,8 @@ use tracing_subscriber::EnvFilter;
 mod app;
 mod bridge;
 mod dialog;
+mod editor;
+mod fonts;
 mod runtime;
 mod sidebar;
 mod state;
