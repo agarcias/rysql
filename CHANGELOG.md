@@ -6,6 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added — Dock layout (editor + results + object inspector)
+- Central panel migrated to `egui_dock` 0.19. Editor buffers, result sets
+  and object inspectors now live as draggable tabs in a single dock area;
+  any tab can be dropped on another to create a horizontal or vertical
+  split, so the user can lay out editor / results side-by-side.
+- Double-clicking a schema-tree item (or its new "Open" context-menu
+  entry) opens an Object inspector tab with three subtabs:
+  - **Structure** — compact tables of columns (name, type, nullable,
+    default, PK, extra, comment) and indexes (name, columns, unique,
+    type), plus a collapsible Foreign keys section sourced from
+    `information_schema.KEY_COLUMN_USAGE ⨝ REFERENTIAL_CONSTRAINTS`.
+  - **Data** — auto-issued `SELECT * FROM db.tbl LIMIT 1000` rendered
+    inside the Object tab (no sibling Results tab); sort, fetch-next-1000
+    and edit-in-place by PK keep working.
+  - **Source** — the matching `SHOW CREATE …` in a read-only syntax-
+    highlighted view.
+  Procedures, functions, triggers and events expose only the Source
+  subtab and default to it. Re-opening the same object focuses the
+  existing tab instead of duplicating it.
+- `Ctrl+W` and File → Close current tab now close whichever tab has
+  focus, regardless of kind. New View entries: Close all SQL tabs / Close
+  all results tabs. File → New SQL tab mirrors `Ctrl+T`.
+- Hover-tooltip on tab buttons: Object tabs show `<Kind> · db.name`;
+  Results tabs show the original SQL.
+- UX safety net: closing the last tab (via any path) seeds a fresh empty
+  `query-1` editor so the dock is never empty.
+
 ### Added
 - Phase 6 packaging: `cargo-deb` metadata, AUR `PKGBUILD`, AppImage build
   script, `cargo-generate-rpm` metadata, AppStream metainfo, desktop file
@@ -14,6 +41,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `.deb`, an AppImage and a Windows `.exe` (cross-compiled from Linux via
   `cargo-xwin`) and publishes them as GitHub release assets.
 - `README.md` and `CHANGELOG.md` at the repo root.
+
+### Changed
+- The fixed bottom results panel is gone — result sets land as
+  `DockTab::Results` tabs in the focused leaf instead. Past the 16-tab
+  cap the oldest result tab is evicted and removed from the dock too.
+- `rysql-db::schema` gains `ColumnInfo`, `IndexInfo`, `ForeignKeyInfo`
+  types and `list_columns` / `list_indexes` / `list_foreign_keys` async
+  helpers, mirrored as `DbActor` commands. `ObjectKind` now derives
+  `Hash` so it can key the UI-side object map.
 
 ## [0.6.0] — 2026-05-24
 

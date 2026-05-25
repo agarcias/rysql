@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 use egui_dock::{tab_viewer::OnCloseResponse, TabViewer};
+use rysql_db::ObjectKind;
 use rysql_sql::Highlighter;
 
 use crate::editor::{self, EditorContext, EditorState};
@@ -164,6 +165,32 @@ impl TabViewer for AppViewer<'_> {
                     );
                 }
             }
+        }
+    }
+
+    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
+        match tab {
+            DockTab::Object { key } => {
+                let kind = match key.kind {
+                    ObjectKind::Table => "Table",
+                    ObjectKind::View => "View",
+                    ObjectKind::Procedure => "Procedure",
+                    ObjectKind::Function => "Function",
+                    ObjectKind::Trigger => "Trigger",
+                    ObjectKind::Event => "Event",
+                };
+                response
+                    .clone()
+                    .on_hover_text(format!("{kind} · `{}`.`{}`", key.db, key.name));
+            }
+            DockTab::Results { tab_id } => {
+                if let Some(i) = self.results.find_by_id(*tab_id) {
+                    if let Some(tab) = self.results.tabs.get(i) {
+                        response.clone().on_hover_text(&tab.sql);
+                    }
+                }
+            }
+            DockTab::SqlEditor { .. } => {}
         }
     }
 

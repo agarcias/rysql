@@ -726,7 +726,7 @@ impl RysqlApp {
         for action in actions {
             match action {
                 EditorAction::NewTab => self.open_new_editor_tab(),
-                EditorAction::CloseTab => self.close_focused_editor_tab(),
+                EditorAction::CloseTab => self.close_focused_dock_tab(),
                 EditorAction::Format => editor::apply_format(&mut self.editor),
                 EditorAction::ToggleComment => editor::apply_toggle_comment(&mut self.editor),
                 EditorAction::Execute(arg) => {
@@ -746,11 +746,11 @@ impl RysqlApp {
             .push_to_focused_leaf(DockTab::SqlEditor { buffer_id: id });
     }
 
-    /// Close the editor tab in the currently-focused leaf, if any.
-    /// `on_close` on the viewer records a [`DockAction::CloseEditorBuffer`]
-    /// only when the user clicks the tab's close button; for shortcut-driven
-    /// closes we drive both sides here.
-    fn close_focused_editor_tab(&mut self) {
+    /// Close the dock tab in the currently-focused leaf, regardless of
+    /// variant. `on_close` on the viewer only fires when the user clicks the
+    /// tab's close button — for shortcut-driven closes (`Ctrl+W`, menu) we
+    /// drive both the dock removal and the matching state cleanup here.
+    fn close_focused_dock_tab(&mut self) {
         let Some(node_path) = self.dock.focused_leaf() else {
             return;
         };
@@ -758,14 +758,61 @@ impl RysqlApp {
             return;
         };
         let active_tab_idx = leaf.active;
-        let Some(DockTab::SqlEditor { buffer_id }) = leaf.tabs.get(active_tab_idx.0).cloned()
-        else {
+        let Some(tab) = leaf.tabs.get(active_tab_idx.0).cloned() else {
             return;
         };
         let tab_path = egui_dock::TabPath::new(node_path.surface, node_path.node, active_tab_idx);
         self.dock.remove_tab(tab_path);
-        self.editor.close_buffer_by_id(buffer_id);
+        self.dispose_tab_state(tab);
         self.ensure_at_least_one_editor_tab();
+    }
+
+    /// Free whatever backing state lives outside the dock for a tab that
+    /// has just been removed: the editor buffer, the result set, or the
+    /// object inspector entry (and its embedded data result).
+    fn dispose_tab_state(&mut self, tab: DockTab) {
+        match tab {
+            DockTab::SqlEditor { buffer_id } => self.editor.close_buffer_by_id(buffer_id),
+            DockTab::Results { tab_id } => {
+                self.results.remove_by_id(tab_id);
+            }
+            DockTab::Object { key } => {
+                if let Some(state) = self.objects.remove(&key) {
+                    if let Some(data_id) = state.data_tab_id() {
+                        self.results.remove_by_id(data_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Close every dock tab matching `predicate`. Uses a find-and-remove
+    /// loop so tab indices never go stale between removals.
+    fn close_all_dock_tabs_matching<F>(&mut self, predicate: F)
+    where
+        F: Fn(&DockTab) -> bool,
+    {
+        loop {
+            let target = self.dock.iter_all_tabs().find_map(|(path, tab)| {
+                if predicate(tab) {
+                    Some((path, tab.clone()))
+                } else {
+                    None
+                }
+            });
+            let Some((path, tab)) = target else { break };
+            self.dock.remove_tab(path);
+            self.dispose_tab_state(tab);
+        }
+        self.ensure_at_least_one_editor_tab();
+    }
+
+    fn close_all_editor_tabs(&mut self) {
+        self.close_all_dock_tabs_matching(|t| matches!(t, DockTab::SqlEditor { .. }));
+    }
+
+    fn close_all_results_tabs(&mut self) {
+        self.close_all_dock_tabs_matching(|t| matches!(t, DockTab::Results { .. }));
     }
 
     fn apply_dock_actions(&mut self, actions: Vec<DockAction>) {
@@ -1203,6 +1250,15 @@ impl RysqlApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("New SQL tab").clicked() {
+                    self.open_new_editor_tab();
+                    ui.close();
+                }
+                if ui.button("Close current tab").clicked() {
+                    self.close_focused_dock_tab();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1242,6 +1298,15 @@ impl RysqlApp {
                     if let Err(e) = self.settings_store.save(&self.settings) {
                         tracing::warn!(error = %e, "failed to persist settings");
                     }
+                }
+                ui.separator();
+                if ui.button("Close all SQL tabs").clicked() {
+                    self.close_all_editor_tabs();
+                    ui.close();
+                }
+                if ui.button("Close all results tabs").clicked() {
+                    self.close_all_results_tabs();
+                    ui.close();
                 }
             });
             egui::containers::menu::MenuButton::new("Help").ui(ui, |ui| {

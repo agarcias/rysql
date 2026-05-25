@@ -16,15 +16,25 @@ A desktop GUI client for **MySQL** and **MariaDB**, written in Rust.
 - **Schema browser** — lazy tree of databases → tables / views / procedures
   / functions / triggers / events with copy-name, copy-CREATE and
   destructive actions guarded by a type-to-confirm modal.
-- **SQL editor** — multi-tab, syntect syntax highlighting, JetBrains Mono
-  for code, Inter for UI, autocomplete from keywords and the current
-  schema. Shortcuts: `Ctrl+Enter` (run at cursor), `Ctrl+Shift+Enter`
-  (run buffer), `Ctrl+/` (toggle line comment), `Ctrl+Shift+F` (format),
-  `Ctrl+T` / `Ctrl+W` (tab management).
-- **Results pane** — virtualized sortable grid with typed cells, NULL /
+- **Dockable workspace** — central panel powered by `egui_dock`: SQL
+  editors, result grids and object inspectors are all tabs in the same
+  area. Drag any tab on top of another to create a horizontal / vertical
+  split (editor + results side-by-side, two queries next to each other,
+  etc). Closing the last tab auto-creates a fresh `query-1`.
+- **SQL editor** — syntect syntax highlighting, JetBrains Mono for code,
+  Inter for UI, autocomplete from keywords and the current schema.
+  Shortcuts: `Ctrl+Enter` (run at cursor), `Ctrl+Shift+Enter` (run
+  buffer), `Ctrl+/` (toggle line comment), `Ctrl+Shift+F` (format),
+  `Ctrl+T` (new SQL tab), `Ctrl+W` (close focused tab — any kind).
+- **Results tabs** — virtualized sortable grid with typed cells, NULL /
   BLOB / JSON rendering, automatic `LIMIT` pagination with "fetch next",
-  CSV / TSV / SQL INSERT export to clipboard, BLOB hex viewer, and
+  CSV / TSV / SQL INSERT export via tab right-click, BLOB hex viewer, and
   **edit-in-place** by detected primary key with a SQL-preview confirm.
+- **Object inspector** — double-click a sidebar item to open a tab with
+  three subtabs: *Structure* (columns + indexes + outgoing FKs),
+  *Data* (first 1000 rows, sort + edit + fetch-next) and *Source*
+  (`SHOW CREATE …` with syntax highlight). Re-opening focuses the
+  existing tab.
 - **UX** — friendly MySQL error messages (1062, 1146, 1213, …),
   searchable persistent history, query cancel button while running,
   light / dark / system theme, rotated logs and a panic-to-crashlog hook.
