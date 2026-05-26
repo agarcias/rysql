@@ -1117,9 +1117,11 @@ impl RysqlApp {
     /// Prompt for a `.sql` file. On success, either open it as a new tab or,
     /// if the file is already loaded in some buffer, focus that tab instead.
     fn open_file_dialog(&mut self) {
-        let Some(path) = pick_open_path() else {
+        let initial = self.settings.last_browse_dir.clone();
+        let Some(path) = pick_open_path(initial.as_deref()) else {
             return;
         };
+        self.remember_browse_dir(path.parent());
         match self.editor.open_path(path) {
             Ok((buffer_id, loaded)) => {
                 if loaded {
@@ -1133,6 +1135,22 @@ impl RysqlApp {
             Err(e) => {
                 self.last_error = Some(format!("Open file: {e}"));
             }
+        }
+    }
+
+    /// Persist the directory the user last navigated to in a file picker
+    /// so future pickers re-open there. Saves `settings.toml` only when
+    /// the value actually changes.
+    fn remember_browse_dir(&mut self, dir: Option<&Path>) {
+        let Some(dir) = dir else {
+            return;
+        };
+        if self.settings.last_browse_dir.as_deref() == Some(dir) {
+            return;
+        }
+        self.settings.last_browse_dir = Some(dir.to_path_buf());
+        if let Err(e) = self.settings_store.save(&self.settings) {
+            tracing::warn!(error = %e, "failed to persist last_browse_dir");
         }
     }
 
@@ -1201,9 +1219,11 @@ impl RysqlApp {
             return false;
         };
         let suggested = buf.path.clone();
-        let Some(target) = pick_save_path(suggested.as_deref()) else {
+        let fallback = self.settings.last_browse_dir.clone();
+        let Some(target) = pick_save_path(suggested.as_deref(), fallback.as_deref()) else {
             return false;
         };
+        self.remember_browse_dir(target.parent());
         match self.editor.save_as(buffer_id, target) {
             Ok(()) => {
                 self.report_save_success(buffer_id);
@@ -2228,18 +2248,22 @@ fn sql_label(sql: &str) -> String {
 /// is not part of any runtime, so we enter our background runtime for the
 /// duration of the picker call — the dispatched zbus tasks then run on
 /// the runtime thread while the dialog blocks the UI thread.
-fn pick_open_path() -> Option<PathBuf> {
+fn pick_open_path(initial_dir: Option<&Path>) -> Option<PathBuf> {
     let _guard = crate::runtime::handle().enter();
-    rfd::FileDialog::new()
+    let mut d = rfd::FileDialog::new()
         .add_filter("SQL", &["sql"])
-        .add_filter("All files", &["*"])
-        .pick_file()
+        .add_filter("All files", &["*"]);
+    if let Some(dir) = initial_dir {
+        d = d.set_directory(dir);
+    }
+    d.pick_file()
 }
 
 /// Blocking native picker for a save destination. When `suggested` is given
-/// (the buffer already has a path), pre-seeds directory and filename. See
-/// [`pick_open_path`] for the Tokio context note.
-fn pick_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
+/// (the buffer already has a path), pre-seeds directory and filename. For
+/// scratch buffers, `fallback_dir` lands the picker where the user last
+/// browsed. See [`pick_open_path`] for the Tokio context note.
+fn pick_save_path(suggested: Option<&Path>, fallback_dir: Option<&Path>) -> Option<PathBuf> {
     let _guard = crate::runtime::handle().enter();
     let mut d = rfd::FileDialog::new().add_filter("SQL", &["sql"]);
     if let Some(p) = suggested {
@@ -2250,6 +2274,9 @@ fn pick_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
             d = d.set_file_name(name.to_string_lossy().as_ref());
         }
     } else {
+        if let Some(dir) = fallback_dir {
+            d = d.set_directory(dir);
+        }
         d = d.set_file_name("untitled.sql");
     }
     d.save_file()

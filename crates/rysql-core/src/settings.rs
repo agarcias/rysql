@@ -22,6 +22,11 @@ pub struct AppSettings {
     pub theme: ThemeChoice,
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
+    /// Last directory the user navigated to in any file picker
+    /// (Open SQL file / Save as…). Used to seed the next picker so
+    /// browsing a deep tree once is enough. Serialised on every change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_browse_dir: Option<PathBuf>,
 }
 
 fn default_history_limit() -> usize {
