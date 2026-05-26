@@ -190,7 +190,13 @@ impl TabViewer for AppViewer<'_> {
                     }
                 }
             }
-            DockTab::SqlEditor { .. } => {}
+            DockTab::SqlEditor { buffer_id } => {
+                if let Some(buf) = self.editor.buffer_by_id(*buffer_id) {
+                    if let Some(path) = buf.path.as_ref() {
+                        response.clone().on_hover_text(path.display().to_string());
+                    }
+                }
+            }
         }
     }
 

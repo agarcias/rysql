@@ -16,9 +16,6 @@ pub struct Buffer {
     pub dirty: bool,
     /// `Some(p)` — buffer respaldado por un archivo en disco; `name` es el
     /// basename de `p`. `None` — buffer "scratch" todavía no guardado.
-    ///
-    /// Lo cablea Day 2 (atajos / menú); por ahora sólo lo usan los tests.
-    #[allow(dead_code)]
     pub path: Option<PathBuf>,
 }
 
@@ -127,7 +124,6 @@ impl EditorState {
     /// Localiza un buffer cuyo `path` canónico coincida con el argumento.
     /// El caller pasa una ruta ya canonicalizada (es lo que hace
     /// [`Self::open_path`] internamente).
-    #[allow(dead_code)] // wired up in Day 2
     pub fn buffer_by_path(&self, path: &Path) -> Option<&Buffer> {
         self.buffers
             .iter()
@@ -141,7 +137,6 @@ impl EditorState {
     /// `buffers`. Si no, lee el contenido (normalizando `\r\n` → `\n`),
     /// añade un nuevo buffer limpio (`dirty = false`) y devuelve su id con
     /// `loaded = true`.
-    #[allow(dead_code)] // wired up in Day 2
     pub fn open_path(&mut self, path: PathBuf) -> std::io::Result<(u64, bool)> {
         let canonical = std::fs::canonicalize(&path)?;
         if let Some(existing) = self.buffer_by_path(&canonical) {
@@ -172,7 +167,6 @@ impl EditorState {
 
     /// Guarda el buffer en su `path` actual. Error si el buffer no tiene
     /// path (usar [`Self::save_as`] primero).
-    #[allow(dead_code)] // wired up in Day 2
     pub fn save(&mut self, buffer_id: u64) -> std::io::Result<()> {
         let idx = self
             .buffer_index(buffer_id)
@@ -192,7 +186,6 @@ impl EditorState {
     /// Guarda el buffer a `path`, actualiza su `path` y `name`. Si otro
     /// buffer ya tiene este archivo abierto, devuelve `AlreadyExists` y no
     /// escribe.
-    #[allow(dead_code)] // wired up in Day 2
     pub fn save_as(&mut self, buffer_id: u64, path: PathBuf) -> std::io::Result<()> {
         let idx = self
             .buffer_index(buffer_id)
@@ -239,6 +232,13 @@ pub enum EditorAction {
     Execute(String),
     Format,
     ToggleComment,
+    /// Open a `.sql` file from disk into a new (or already-open) editor tab.
+    Open,
+    /// Save the active buffer. Falls back to [`Self::SaveAs`] when the
+    /// buffer has no path yet.
+    Save,
+    /// Always prompt for a path and save the active buffer there.
+    SaveAs,
 }
 
 /// External information the editor needs from the rest of the app.
@@ -283,6 +283,19 @@ pub fn handle_shortcuts(ctx: &egui::Context, focused: bool) -> Vec<EditorAction>
         if i.consume_key(egui::Modifiers::COMMAND, w) {
             out.push(EditorAction::CloseTab);
         }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+            out.push(EditorAction::Open);
+        }
+        // Ctrl+Shift+S must be tested before Ctrl+S — `consume_key` won't
+        // match a stricter modifier set if the looser one already took it.
+        if i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::S,
+        ) {
+            out.push(EditorAction::SaveAs);
+        } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+            out.push(EditorAction::Save);
+        }
     });
     out
 }
@@ -308,9 +321,10 @@ fn consume_autocomplete_keys(ctx: &egui::Context) -> Option<AcKey> {
         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
             // Accept on Enter when the popup is open. Because we consume
             // the key here it never reaches the `TextEdit`, so no stray
-            // newline is inserted. Tab falls back to its native role
-            // (focus traversal) and Ctrl+Enter / Ctrl+Shift+Enter still
-            // run queries because both carry a modifier.
+            // newline is inserted. Tab is handled separately as a 4-space
+            // indent (see the post-frame block in `render_one`), and
+            // Ctrl+Enter / Ctrl+Shift+Enter still run queries because
+            // both carry a modifier.
             Some(AcKey::Accept)
         } else {
             None
@@ -383,6 +397,56 @@ pub fn render_one(
         }
     }
 
+    // === Tab → 4 spaces ===
+    // `code_editor()` would otherwise insert a literal `\t`. Only consume
+    // Tab when this buffer's TextEdit actually has keyboard focus so a
+    // background editor doesn't steal the key.
+    let has_focus = egui_ctx.memory(|m| m.has_focus(textedit_id));
+    let tab_pressed =
+        has_focus && egui_ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+    if tab_pressed {
+        if let Some(buf) = state.buffers.get_mut(buf_idx) {
+            const INDENT: &str = "    ";
+            let len = buf.text.len();
+            let (lo, hi) = match state.last_selection {
+                Some((a, b)) if a != b => (a.min(len), b.min(len)),
+                _ => {
+                    let c = state.last_cursor.unwrap_or(len).min(len);
+                    (c, c)
+                }
+            };
+            let new_byte = if lo == hi {
+                // No selection — insert 4 spaces at the caret.
+                buf.text.insert_str(lo, INDENT);
+                lo + INDENT.len()
+            } else if buf.text[lo..hi].contains('\n') {
+                // Multi-line: prefix every non-empty line in the touched
+                // block with INDENT, preserving the line range.
+                let (block_start, block_end) = expand_to_lines(&buf.text, lo, hi);
+                let block = buf.text[block_start..block_end].to_string();
+                let mut out = String::with_capacity(block.len() + block.len() / 4);
+                let mut at_line_start = true;
+                for ch in block.chars() {
+                    if at_line_start && ch != '\n' {
+                        out.push_str(INDENT);
+                    }
+                    out.push(ch);
+                    at_line_start = ch == '\n';
+                }
+                let new_end = block_start + out.len();
+                buf.text.replace_range(block_start..block_end, &out);
+                new_end
+            } else {
+                // Single-line selection — replace with INDENT like a
+                // regular character.
+                buf.text.replace_range(lo..hi, INDENT);
+                lo + INDENT.len()
+            };
+            buf.dirty = true;
+            cursor_to_set = Some(char_index_from_byte(&buf.text, new_byte));
+        }
+    }
+
     if let Some(new_char_pos) = cursor_to_set {
         if let Some(mut st) = egui::widgets::text_edit::TextEditState::load(&egui_ctx, textedit_id)
         {
@@ -402,9 +466,12 @@ pub fn render_one(
     };
 
     let highlighter = &mut state.highlighter;
-    let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+    // Wrap is disabled so each logical line maps to exactly one visual row,
+    // which keeps the gutter line numbers aligned (DBForge / DataGrip style).
+    // Horizontal scrolling is provided by `ScrollArea::both`.
+    let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
         let mut job = build_layout_job(text.as_str(), highlighter, ui);
-        job.wrap.max_width = wrap_width;
+        job.wrap.max_width = f32::INFINITY;
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
@@ -415,38 +482,48 @@ pub fn render_one(
     egui::Frame::default()
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    let output = egui::TextEdit::multiline(&mut buf.text)
-                        .id(textedit_id)
-                        .font(egui::TextStyle::Monospace)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(20)
-                        .layouter(&mut layouter)
-                        .show(ui);
+                    ui.horizontal_top(|ui| {
+                        // Spacing between gutter and editor is controlled by
+                        // the trailing-space-only gutter text; remove the
+                        // default 4 px gap so the cursor sits flush against
+                        // the numbers like in DataGrip.
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        render_line_number_gutter(ui, &buf.text);
 
-                    if buf.text != before {
-                        buf.dirty = true;
-                    }
-                    focused = output.response.has_focus();
-                    if let Some(range) = output.cursor_range {
-                        let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
-                        let secondary_byte = byte_index_from_char(&buf.text, range.secondary.index);
-                        new_cursor = Some(primary_byte);
-                        new_selection = Some((
-                            primary_byte.min(secondary_byte),
-                            primary_byte.max(secondary_byte),
-                        ));
+                        let output = egui::TextEdit::multiline(&mut buf.text)
+                            .id(textedit_id)
+                            .font(egui::TextStyle::Monospace)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(20)
+                            .layouter(&mut layouter)
+                            .show(ui);
 
-                        // Popup anchor: just below the cursor in screen space.
-                        let rect = output.galley.pos_from_cursor(range.primary);
-                        popup_anchor = Some(egui::Pos2 {
-                            x: output.galley_pos.x + rect.min.x,
-                            y: output.galley_pos.y + rect.max.y + 2.0,
-                        });
-                    }
+                        if buf.text != before {
+                            buf.dirty = true;
+                        }
+                        focused = output.response.has_focus();
+                        if let Some(range) = output.cursor_range {
+                            let primary_byte = byte_index_from_char(&buf.text, range.primary.index);
+                            let secondary_byte =
+                                byte_index_from_char(&buf.text, range.secondary.index);
+                            new_cursor = Some(primary_byte);
+                            new_selection = Some((
+                                primary_byte.min(secondary_byte),
+                                primary_byte.max(secondary_byte),
+                            ));
+
+                            // Popup anchor: just below the cursor in screen space.
+                            let rect = output.galley.pos_from_cursor(range.primary);
+                            popup_anchor = Some(egui::Pos2 {
+                                x: output.galley_pos.x + rect.min.x,
+                                y: output.galley_pos.y + rect.max.y + 2.0,
+                            });
+                        }
+                    });
                 });
         });
 
@@ -467,6 +544,29 @@ pub fn render_one(
     }
 
     focused
+}
+
+/// Paint a non-selectable left gutter with one line number per logical
+/// line of `text`. Uses the same monospace style as the editor so rows
+/// align without further configuration. A trailing space pads each line
+/// to separate it from the editor cursor visually.
+fn render_line_number_gutter(ui: &mut egui::Ui, text: &str) {
+    // `split('\n')` keeps the trailing empty line when the buffer ends in
+    // a newline, matching what the TextEdit visually shows.
+    let line_count = text.split('\n').count().max(1);
+    let width = line_count.to_string().len().max(2);
+    let gutter: String = (1..=line_count)
+        .map(|n| format!("{n:>width$} ", n = n, width = width))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(gutter)
+                .monospace()
+                .color(egui::Color32::from_gray(110)),
+        )
+        .selectable(false),
+    );
 }
 
 fn refresh_autocomplete(

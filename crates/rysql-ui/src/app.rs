@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, Style};
@@ -1094,6 +1095,9 @@ impl RysqlApp {
                         self.last_info = Some("Nothing to execute".into());
                     }
                 }
+                EditorAction::Open => self.open_file_dialog(),
+                EditorAction::Save => self.save_active_buffer(),
+                EditorAction::SaveAs => self.save_active_buffer_as(),
             }
         }
     }
@@ -1102,6 +1106,100 @@ impl RysqlApp {
         let id = self.editor.new_buffer();
         self.dock
             .push_to_focused_leaf(DockTab::SqlEditor { buffer_id: id });
+    }
+
+    /// Prompt for a `.sql` file. On success, either open it as a new tab or,
+    /// if the file is already loaded in some buffer, focus that tab instead.
+    fn open_file_dialog(&mut self) {
+        let Some(path) = pick_open_path() else {
+            return;
+        };
+        match self.editor.open_path(path) {
+            Ok((buffer_id, loaded)) => {
+                if loaded {
+                    self.dock
+                        .push_to_focused_leaf(DockTab::SqlEditor { buffer_id });
+                } else {
+                    self.focus_editor_tab(buffer_id);
+                }
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Open file: {e}"));
+            }
+        }
+    }
+
+    /// Bring the dock tab backing `buffer_id` to the front. Falls back to
+    /// pushing a fresh tab if the buffer exists but no tab references it
+    /// (shouldn't happen, but defensive).
+    fn focus_editor_tab(&mut self, buffer_id: u64) {
+        let existing = self.dock.iter_all_tabs().find_map(|(path, tab)| {
+            matches!(tab, DockTab::SqlEditor { buffer_id: id } if *id == buffer_id).then_some(path)
+        });
+        if let Some(path) = existing {
+            let _ = self.dock.set_active_tab(path);
+        } else {
+            self.dock
+                .push_to_focused_leaf(DockTab::SqlEditor { buffer_id });
+        }
+    }
+
+    /// Ctrl+S. Saves the active buffer in place when it has a path; falls
+    /// through to Save As when it's still a `query-N` scratch.
+    fn save_active_buffer(&mut self) {
+        let Some(buf) = self.editor.active_buffer() else {
+            return;
+        };
+        let id = buf.id;
+        if buf.path.is_none() {
+            self.save_active_buffer_as();
+            return;
+        }
+        match self.editor.save(id) {
+            Ok(()) => {
+                let saved_path = self
+                    .editor
+                    .buffer_by_id(id)
+                    .and_then(|b| b.path.clone())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.last_error = None;
+                self.last_info = Some(format!("Saved {saved_path}"));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Save: {e}"));
+            }
+        }
+    }
+
+    /// Ctrl+Shift+S. Always prompts for a destination path; routes through
+    /// `EditorState::save_as`, which also handles the "another tab already
+    /// owns this file" conflict.
+    fn save_active_buffer_as(&mut self) {
+        let Some(buf) = self.editor.active_buffer() else {
+            return;
+        };
+        let id = buf.id;
+        let suggested = buf.path.clone();
+        let Some(target) = pick_save_path(suggested.as_deref()) else {
+            return;
+        };
+        match self.editor.save_as(id, target) {
+            Ok(()) => {
+                let saved_path = self
+                    .editor
+                    .buffer_by_id(id)
+                    .and_then(|b| b.path.clone())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.last_error = None;
+                self.last_info = Some(format!("Saved {saved_path}"));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Save as: {e}"));
+            }
+        }
     }
 
     /// Resolve the `tab_id` of the result set behind whatever the user
@@ -1822,11 +1920,23 @@ impl RysqlApp {
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("New SQL tab").clicked() {
+                if ui.button("New SQL tab\tCtrl+T").clicked() {
                     self.open_new_editor_tab();
                     ui.close();
                 }
-                if ui.button("Close current tab").clicked() {
+                if ui.button("Open SQL file…\tCtrl+O").clicked() {
+                    self.open_file_dialog();
+                    ui.close();
+                }
+                if ui.button("Save\tCtrl+S").clicked() {
+                    self.save_active_buffer();
+                    ui.close();
+                }
+                if ui.button("Save as…\tCtrl+Shift+S").clicked() {
+                    self.save_active_buffer_as();
+                    ui.close();
+                }
+                if ui.button("Close current tab\tCtrl+W").clicked() {
                     self.close_focused_dock_tab();
                     ui.close();
                 }
@@ -1996,6 +2106,40 @@ fn sql_label(sql: &str) -> String {
     } else {
         format!("{}…", &one_line.chars().take(47).collect::<String>())
     }
+}
+
+/// Blocking native picker for an existing `.sql` file. Cancelled → `None`.
+///
+/// On Linux/xdg-portal, rfd talks to the desktop portal via `zbus`, which
+/// requires a Tokio reactor in thread-local context. The egui main thread
+/// is not part of any runtime, so we enter our background runtime for the
+/// duration of the picker call — the dispatched zbus tasks then run on
+/// the runtime thread while the dialog blocks the UI thread.
+fn pick_open_path() -> Option<PathBuf> {
+    let _guard = crate::runtime::handle().enter();
+    rfd::FileDialog::new()
+        .add_filter("SQL", &["sql"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
+/// Blocking native picker for a save destination. When `suggested` is given
+/// (the buffer already has a path), pre-seeds directory and filename. See
+/// [`pick_open_path`] for the Tokio context note.
+fn pick_save_path(suggested: Option<&Path>) -> Option<PathBuf> {
+    let _guard = crate::runtime::handle().enter();
+    let mut d = rfd::FileDialog::new().add_filter("SQL", &["sql"]);
+    if let Some(p) = suggested {
+        if let Some(dir) = p.parent() {
+            d = d.set_directory(dir);
+        }
+        if let Some(name) = p.file_name() {
+            d = d.set_file_name(name.to_string_lossy().as_ref());
+        }
+    } else {
+        d = d.set_file_name("untitled.sql");
+    }
+    d.save_file()
 }
 
 impl eframe::App for RysqlApp {
