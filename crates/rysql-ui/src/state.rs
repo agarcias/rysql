@@ -57,6 +57,26 @@ pub struct ConfirmAction {
     pub kind: PendingExec,
 }
 
+/// Pending "this editor tab has unsaved changes" prompt. The dock tab
+/// stays open until the modal is resolved.
+#[derive(Debug, Clone)]
+pub struct UnsavedCloseAction {
+    pub buffer_id: u64,
+    pub name: String,
+    /// Whether the buffer is backed by a file already. Drives the Save
+    /// button label (Save vs Save as…); the actual fall-through to a
+    /// Save-As picker for buffers without a path lives in the app.
+    pub has_path: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnsavedCloseChoice {
+    None,
+    Save,
+    Discard,
+    Cancel,
+}
+
 #[derive(Debug, Clone)]
 pub enum PendingExec {
     DropObject {

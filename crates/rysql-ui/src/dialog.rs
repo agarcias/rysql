@@ -3,7 +3,7 @@
 use eframe::egui;
 use rysql_core::{ConnectionProfile, TlsMode};
 
-use crate::state::ConfirmAction;
+use crate::state::{ConfirmAction, UnsavedCloseAction, UnsavedCloseChoice};
 
 #[derive(Debug, Clone)]
 pub struct NewConnectionDialog {
@@ -311,4 +311,47 @@ fn confirm_target_label(action: &ConfirmAction) -> &'static str {
         PendingExec::AlterColumn { .. } => "column",
         PendingExec::DropColumn { .. } => "column",
     }
+}
+
+/// Three-button modal asking what to do with a dirty editor buffer the
+/// user just tried to close. Save uses the buffer's existing path; if it
+/// has none, the app falls through to a Save-As picker.
+pub fn show_unsaved_close(ctx: &egui::Context, action: &UnsavedCloseAction) -> UnsavedCloseChoice {
+    let mut choice = UnsavedCloseChoice::None;
+    egui::Modal::new(egui::Id::new("unsaved-close-modal")).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading("Unsaved changes");
+        ui.add_space(8.0);
+        ui.label(format!("'{}' has unsaved changes.", action.name));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Save them to disk, discard them, or cancel?")
+                .weak()
+                .small(),
+        );
+        ui.add_space(12.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                choice = UnsavedCloseChoice::Cancel;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save_label = if action.has_path {
+                    "Save"
+                } else {
+                    "Save as…"
+                };
+                if ui.button(save_label).clicked() {
+                    choice = UnsavedCloseChoice::Save;
+                }
+                let discard = egui::Button::new(
+                    egui::RichText::new("Discard").color(egui::Color32::from_rgb(0xe5, 0x73, 0x73)),
+                );
+                if ui.add(discard).clicked() {
+                    choice = UnsavedCloseChoice::Discard;
+                }
+            });
+        });
+    });
+    choice
 }

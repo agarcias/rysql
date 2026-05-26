@@ -27,6 +27,7 @@ use crate::results::{
 use crate::sidebar::{self, SidebarAction, SidebarInput};
 use crate::state::{
     ActiveConnection, ConfirmAction, LoadState, ObjectKey, PendingExec, SchemaState,
+    UnsavedCloseAction, UnsavedCloseChoice,
 };
 
 pub struct RysqlApp {
@@ -40,6 +41,10 @@ pub struct RysqlApp {
     last_info: Option<String>,
     confirm: Option<ConfirmAction>,
     confirm_typed: String,
+    /// Pending "the editor tab you tried to close has unsaved changes"
+    /// modal. The corresponding dock tab is kept open until the user
+    /// resolves the modal.
+    unsaved_close: Option<UnsavedCloseAction>,
     editor: EditorState,
     dock: DockState<DockTab>,
     results: ResultsState,
@@ -111,6 +116,7 @@ impl RysqlApp {
             last_info: None,
             confirm: None,
             confirm_typed: String::new(),
+            unsaved_close: None,
             editor,
             dock,
             results: ResultsState::default(),
@@ -1148,58 +1154,77 @@ impl RysqlApp {
     /// Ctrl+S. Saves the active buffer in place when it has a path; falls
     /// through to Save As when it's still a `query-N` scratch.
     fn save_active_buffer(&mut self) {
-        let Some(buf) = self.editor.active_buffer() else {
+        let Some(id) = self.editor.active_buffer().map(|b| b.id) else {
             return;
         };
-        let id = buf.id;
-        if buf.path.is_none() {
-            self.save_active_buffer_as();
-            return;
-        }
-        match self.editor.save(id) {
-            Ok(()) => {
-                let saved_path = self
-                    .editor
-                    .buffer_by_id(id)
-                    .and_then(|b| b.path.clone())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.last_error = None;
-                self.last_info = Some(format!("Saved {saved_path}"));
-            }
-            Err(e) => {
-                self.last_error = Some(format!("Save: {e}"));
-            }
-        }
+        let _ = self.save_buffer(id);
     }
 
     /// Ctrl+Shift+S. Always prompts for a destination path; routes through
     /// `EditorState::save_as`, which also handles the "another tab already
     /// owns this file" conflict.
     fn save_active_buffer_as(&mut self) {
-        let Some(buf) = self.editor.active_buffer() else {
+        let Some(id) = self.editor.active_buffer().map(|b| b.id) else {
             return;
         };
-        let id = buf.id;
+        let _ = self.save_buffer_as(id);
+    }
+
+    /// Save the buffer with `buffer_id`. Returns `true` on success.
+    /// Falls back to [`Self::save_buffer_as`] when the buffer has no path.
+    /// The unsaved-close modal uses the return value to decide whether to
+    /// proceed with the actual tab close.
+    fn save_buffer(&mut self, buffer_id: u64) -> bool {
+        let Some(buf) = self.editor.buffer_by_id(buffer_id) else {
+            return false;
+        };
+        if buf.path.is_none() {
+            return self.save_buffer_as(buffer_id);
+        }
+        match self.editor.save(buffer_id) {
+            Ok(()) => {
+                self.report_save_success(buffer_id);
+                true
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Save: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Save-As for `buffer_id`. Returns `true` on success (the user picked
+    /// a path and the write succeeded). Cancelling the picker counts as a
+    /// failure so the unsaved-close flow can abort the tab close.
+    fn save_buffer_as(&mut self, buffer_id: u64) -> bool {
+        let Some(buf) = self.editor.buffer_by_id(buffer_id) else {
+            return false;
+        };
         let suggested = buf.path.clone();
         let Some(target) = pick_save_path(suggested.as_deref()) else {
-            return;
+            return false;
         };
-        match self.editor.save_as(id, target) {
+        match self.editor.save_as(buffer_id, target) {
             Ok(()) => {
-                let saved_path = self
-                    .editor
-                    .buffer_by_id(id)
-                    .and_then(|b| b.path.clone())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.last_error = None;
-                self.last_info = Some(format!("Saved {saved_path}"));
+                self.report_save_success(buffer_id);
+                true
             }
             Err(e) => {
                 self.last_error = Some(format!("Save as: {e}"));
+                false
             }
         }
+    }
+
+    fn report_save_success(&mut self, buffer_id: u64) {
+        let saved_path = self
+            .editor
+            .buffer_by_id(buffer_id)
+            .and_then(|b| b.path.clone())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.last_error = None;
+        self.last_info = Some(format!("Saved {saved_path}"));
     }
 
     /// Resolve the `tab_id` of the result set behind whatever the user
@@ -1246,6 +1271,9 @@ impl RysqlApp {
     /// variant. `on_close` on the viewer only fires when the user clicks the
     /// tab's close button — for shortcut-driven closes (`Ctrl+W`, menu) we
     /// drive both the dock removal and the matching state cleanup here.
+    ///
+    /// Dirty editor buffers route through the unsaved-close modal instead
+    /// of being disposed immediately.
     fn close_focused_dock_tab(&mut self) {
         let Some(node_path) = self.dock.focused_leaf() else {
             return;
@@ -1257,10 +1285,46 @@ impl RysqlApp {
         let Some(tab) = leaf.tabs.get(active_tab_idx.0).cloned() else {
             return;
         };
+        if let DockTab::SqlEditor { buffer_id } = &tab {
+            if self
+                .editor
+                .buffer_by_id(*buffer_id)
+                .is_some_and(|b| b.dirty)
+            {
+                self.open_unsaved_close_modal(*buffer_id);
+                return;
+            }
+        }
         let tab_path = egui_dock::TabPath::new(node_path.surface, node_path.node, active_tab_idx);
         self.dock.remove_tab(tab_path);
         self.dispose_tab_state(tab);
         self.pending_editor_focus = true;
+    }
+
+    /// Remove the dock tab backing `buffer_id` (if any) and free the
+    /// editor buffer. Used by the unsaved-close modal's Save / Discard
+    /// branches once the dirty state is resolved.
+    fn close_editor_tab(&mut self, buffer_id: u64) {
+        let target = self.dock.iter_all_tabs().find_map(|(path, tab)| {
+            matches!(tab, DockTab::SqlEditor { buffer_id: id } if *id == buffer_id).then_some(path)
+        });
+        if let Some(path) = target {
+            self.dock.remove_tab(path);
+        }
+        self.editor.close_buffer_by_id(buffer_id);
+        self.pending_editor_focus = true;
+    }
+
+    /// Stage an unsaved-close prompt for `buffer_id`. The dock tab stays
+    /// open; rendering of the modal happens later in the frame.
+    fn open_unsaved_close_modal(&mut self, buffer_id: u64) {
+        if let Some(buf) = self.editor.buffer_by_id(buffer_id) {
+            self.unsaved_close = Some(UnsavedCloseAction {
+                buffer_id,
+                name: buf.name.clone(),
+                has_path: buf.path.is_some(),
+            });
+        }
     }
 
     /// Free whatever backing state lives outside the dock for a tab that
@@ -1307,8 +1371,24 @@ impl RysqlApp {
         }
     }
 
+    /// Bulk close from the View menu. Free every clean editor tab first;
+    /// if any dirty buffers remain, open the unsaved-close prompt for the
+    /// first one so the user resolves them one at a time.
     fn close_all_editor_tabs(&mut self) {
-        self.close_all_dock_tabs_matching(|t| matches!(t, DockTab::SqlEditor { .. }));
+        let clean: Vec<u64> = self
+            .editor
+            .buffers
+            .iter()
+            .filter(|b| !b.dirty)
+            .map(|b| b.id)
+            .collect();
+        for id in clean {
+            self.close_editor_tab(id);
+        }
+        let next_dirty = self.editor.buffers.iter().find(|b| b.dirty).map(|b| b.id);
+        if let Some(id) = next_dirty {
+            self.open_unsaved_close_modal(id);
+        }
     }
 
     fn close_all_results_tabs(&mut self) {
@@ -1342,6 +1422,9 @@ impl RysqlApp {
                     if let Some(idx) = self.editor.buffer_index(id) {
                         self.editor.active = idx;
                     }
+                }
+                DockAction::PromptUnsavedClose(id) => {
+                    self.open_unsaved_close_modal(id);
                 }
             }
         }
@@ -2097,6 +2180,36 @@ impl RysqlApp {
             }
         }
     }
+
+    /// Render the unsaved-close modal, if any. Skipped while the SQL
+    /// `confirm` modal is up so the two never stack on top of each other.
+    fn render_unsaved_close(&mut self, ctx: &egui::Context) {
+        if self.confirm.is_some() {
+            return;
+        }
+        let Some(action) = self.unsaved_close.as_ref().cloned() else {
+            return;
+        };
+        match dialog::show_unsaved_close(ctx, &action) {
+            UnsavedCloseChoice::None => {}
+            UnsavedCloseChoice::Cancel => {
+                self.unsaved_close = None;
+            }
+            UnsavedCloseChoice::Discard => {
+                self.unsaved_close = None;
+                self.close_editor_tab(action.buffer_id);
+            }
+            UnsavedCloseChoice::Save => {
+                // Dismiss the modal up-front: `save_buffer` may pop a
+                // native Save-As dialog which would otherwise look like
+                // it's stacked on top of ours.
+                self.unsaved_close = None;
+                if self.save_buffer(action.buffer_id) {
+                    self.close_editor_tab(action.buffer_id);
+                }
+            }
+        }
+    }
 }
 
 fn sql_label(sql: &str) -> String {
@@ -2222,6 +2335,7 @@ impl eframe::App for RysqlApp {
 
         self.render_dialog(&ctx);
         self.render_confirm(&ctx);
+        self.render_unsaved_close(&ctx);
 
         let viewer_actions = results::render_blob_viewer(&ctx, &mut self.results.blob_viewer);
         self.apply_results_actions(&ctx, viewer_actions);

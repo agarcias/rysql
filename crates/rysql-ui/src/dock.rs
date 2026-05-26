@@ -52,6 +52,10 @@ pub enum DockAction {
     },
     /// The editor for this buffer is the one with keyboard focus this frame.
     FocusedEditor(u64),
+    /// The user clicked × on a dirty editor tab. The dock keeps the tab
+    /// open (`OnCloseResponse::Ignore`); the app opens the unsaved-close
+    /// modal for `buffer_id`.
+    PromptUnsavedClose(u64),
 }
 
 /// `egui_dock::TabViewer` implementation. Owns short-lived mutable borrows
@@ -220,9 +224,20 @@ impl TabViewer for AppViewer<'_> {
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+        let mut stay = false;
         match tab {
             DockTab::SqlEditor { buffer_id } => {
-                self.actions.push(DockAction::CloseEditorBuffer(*buffer_id));
+                let dirty = self
+                    .editor
+                    .buffer_by_id(*buffer_id)
+                    .is_some_and(|b| b.dirty);
+                if dirty {
+                    self.actions
+                        .push(DockAction::PromptUnsavedClose(*buffer_id));
+                    stay = true;
+                } else {
+                    self.actions.push(DockAction::CloseEditorBuffer(*buffer_id));
+                }
             }
             DockTab::Results { tab_id } => {
                 self.actions.push(DockAction::CloseResultsTab(*tab_id));
@@ -231,6 +246,10 @@ impl TabViewer for AppViewer<'_> {
                 self.actions.push(DockAction::CloseObjectView(key.clone()));
             }
         }
-        OnCloseResponse::Close
+        if stay {
+            OnCloseResponse::Ignore
+        } else {
+            OnCloseResponse::Close
+        }
     }
 }
