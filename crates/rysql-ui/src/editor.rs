@@ -1,5 +1,7 @@
 //! SQL editor: buffers, tabs, syntax-highlighted TextEdit, shortcuts and autocomplete.
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui::{
     self,
     text::{CCursor, CCursorRange, LayoutJob},
@@ -12,6 +14,12 @@ pub struct Buffer {
     pub name: String,
     pub text: String,
     pub dirty: bool,
+    /// `Some(p)` — buffer respaldado por un archivo en disco; `name` es el
+    /// basename de `p`. `None` — buffer "scratch" todavía no guardado.
+    ///
+    /// Lo cablea Day 2 (atajos / menú); por ahora sólo lo usan los tests.
+    #[allow(dead_code)]
+    pub path: Option<PathBuf>,
 }
 
 impl Buffer {
@@ -21,6 +29,7 @@ impl Buffer {
             name,
             text: String::new(),
             dirty: false,
+            path: None,
         }
     }
 }
@@ -113,6 +122,113 @@ impl EditorState {
 
     pub fn buffer_index(&self, id: u64) -> Option<usize> {
         self.buffers.iter().position(|b| b.id == id)
+    }
+
+    /// Localiza un buffer cuyo `path` canónico coincida con el argumento.
+    /// El caller pasa una ruta ya canonicalizada (es lo que hace
+    /// [`Self::open_path`] internamente).
+    #[allow(dead_code)] // wired up in Day 2
+    pub fn buffer_by_path(&self, path: &Path) -> Option<&Buffer> {
+        self.buffers
+            .iter()
+            .find(|b| b.path.as_deref() == Some(path))
+    }
+
+    /// Abre `path` como un buffer respaldado por archivo.
+    ///
+    /// Si el mismo archivo (comparado por su forma canónica) ya está abierto,
+    /// devuelve el id del buffer existente con `loaded = false` y no muta
+    /// `buffers`. Si no, lee el contenido (normalizando `\r\n` → `\n`),
+    /// añade un nuevo buffer limpio (`dirty = false`) y devuelve su id con
+    /// `loaded = true`.
+    #[allow(dead_code)] // wired up in Day 2
+    pub fn open_path(&mut self, path: PathBuf) -> std::io::Result<(u64, bool)> {
+        let canonical = std::fs::canonicalize(&path)?;
+        if let Some(existing) = self.buffer_by_path(&canonical) {
+            return Ok((existing.id, false));
+        }
+        let raw = std::fs::read_to_string(&canonical)?;
+        let text = raw.replace("\r\n", "\n");
+
+        self.next_id += 1;
+        let id = self.next_id;
+        let name = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("query-{id}"));
+        self.buffers.push(Buffer {
+            id,
+            name,
+            text,
+            dirty: false,
+            path: Some(canonical),
+        });
+        self.active = self.buffers.len() - 1;
+        self.last_cursor = None;
+        self.last_selection = None;
+        self.autocomplete = None;
+        Ok((id, true))
+    }
+
+    /// Guarda el buffer en su `path` actual. Error si el buffer no tiene
+    /// path (usar [`Self::save_as`] primero).
+    #[allow(dead_code)] // wired up in Day 2
+    pub fn save(&mut self, buffer_id: u64) -> std::io::Result<()> {
+        let idx = self
+            .buffer_index(buffer_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "buffer not found"))?;
+        let buf = &mut self.buffers[idx];
+        let path = buf.path.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer has no path; use save_as instead",
+            )
+        })?;
+        std::fs::write(&path, &buf.text)?;
+        buf.dirty = false;
+        Ok(())
+    }
+
+    /// Guarda el buffer a `path`, actualiza su `path` y `name`. Si otro
+    /// buffer ya tiene este archivo abierto, devuelve `AlreadyExists` y no
+    /// escribe.
+    #[allow(dead_code)] // wired up in Day 2
+    pub fn save_as(&mut self, buffer_id: u64, path: PathBuf) -> std::io::Result<()> {
+        let idx = self
+            .buffer_index(buffer_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "buffer not found"))?;
+
+        // Conflict check: sólo posible si el target ya existe en disco
+        // (otros buffers almacenan paths canónicos de archivos existentes).
+        if path.exists() {
+            let canonical = std::fs::canonicalize(&path)?;
+            for (i, b) in self.buffers.iter().enumerate() {
+                if i == idx {
+                    continue;
+                }
+                if b.path.as_deref() == Some(canonical.as_path()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "Another tab already has this file open: {}",
+                            canonical.display()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let text = self.buffers[idx].text.clone();
+        std::fs::write(&path, &text)?;
+        let canonical = std::fs::canonicalize(&path)?;
+        let buf = &mut self.buffers[idx];
+        buf.name = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("query-{}", buf.id));
+        buf.path = Some(canonical);
+        buf.dirty = false;
+        Ok(())
     }
 }
 
@@ -640,5 +756,153 @@ pub fn resolve_execute(
         } else {
             Some(s)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Genera una ruta única dentro de `temp_dir` para aislar tests
+    /// concurrentes sin necesitar `tempfile` como dep.
+    fn temp_path() -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rysql-editor-test-{}-{}.sql",
+            std::process::id(),
+            n,
+        ))
+    }
+
+    fn write_temp_sql(content: &str) -> PathBuf {
+        let path = temp_path();
+        std::fs::write(&path, content).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn open_path_loads_file_clean() {
+        let path = write_temp_sql("SELECT 1;");
+        let mut state = EditorState::default();
+        let (id, loaded) = state.open_path(path.clone()).expect("open");
+        assert!(loaded, "first open should report loaded = true");
+        let buf = state.buffer_by_id(id).expect("buffer present");
+        assert_eq!(buf.text, "SELECT 1;");
+        assert!(!buf.dirty);
+        assert_eq!(buf.path.as_deref().map(|p| p.exists()), Some(true));
+        let basename = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(buf.name, basename);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_path_normalizes_crlf() {
+        let path = write_temp_sql("SELECT 1;\r\nSELECT 2;\r\n");
+        let mut state = EditorState::default();
+        let (id, _) = state.open_path(path.clone()).expect("open");
+        let buf = state.buffer_by_id(id).expect("buffer present");
+        assert_eq!(buf.text, "SELECT 1;\nSELECT 2;\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_path_missing_file_errors_and_does_not_mutate() {
+        let path = temp_path();
+        let mut state = EditorState::default();
+        let before = state.buffers.len();
+        let err = state
+            .open_path(path)
+            .expect_err("missing file should error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(state.buffers.len(), before);
+    }
+
+    #[test]
+    fn open_path_deduplicates_same_file() {
+        let path = write_temp_sql("SELECT 1;");
+        let mut state = EditorState::default();
+        let (id1, loaded1) = state.open_path(path.clone()).expect("open 1");
+        let len_after_first = state.buffers.len();
+        let (id2, loaded2) = state.open_path(path.clone()).expect("open 2");
+        assert!(loaded1);
+        assert!(!loaded2, "second open of same file should not load");
+        assert_eq!(id1, id2);
+        assert_eq!(state.buffers.len(), len_after_first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_writes_disk_and_clears_dirty() {
+        let path = write_temp_sql("SELECT 1;");
+        let mut state = EditorState::default();
+        let (id, _) = state.open_path(path.clone()).expect("open");
+        let idx = state.buffer_index(id).expect("idx");
+        state.buffers[idx].text = "SELECT 99;".into();
+        state.buffers[idx].dirty = true;
+
+        state.save(id).expect("save");
+        let buf = state.buffer_by_id(id).expect("buffer present");
+        assert!(!buf.dirty);
+        let on_disk = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(on_disk, "SELECT 99;");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_without_path_errors() {
+        let mut state = EditorState::default();
+        let id = state.buffers[0].id;
+        state.buffers[0].text = "SELECT 1;".into();
+        state.buffers[0].dirty = true;
+        let err = state.save(id).expect_err("scratch buffer cannot save");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn save_as_assigns_path_and_writes() {
+        let mut state = EditorState::default();
+        let id = state.buffers[0].id;
+        state.buffers[0].text = "SELECT 1;".into();
+        state.buffers[0].dirty = true;
+
+        let target = temp_path();
+        state.save_as(id, target.clone()).expect("save_as");
+        let buf = state.buffer_by_id(id).expect("buffer present");
+        assert!(!buf.dirty);
+        let stored = buf.path.clone().expect("path set");
+        // `path` queda canonicalizado.
+        assert!(stored.exists());
+        let on_disk = std::fs::read_to_string(&target).expect("read");
+        assert_eq!(on_disk, "SELECT 1;");
+        let expected_name = target.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(buf.name, expected_name);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn save_as_rejects_path_owned_by_another_buffer() {
+        let path = write_temp_sql("SELECT 1;");
+        let mut state = EditorState::default();
+        let (file_id, _) = state.open_path(path.clone()).expect("open");
+        let scratch_id = state.new_buffer();
+        state
+            .buffers
+            .iter_mut()
+            .find(|b| b.id == scratch_id)
+            .unwrap()
+            .text = "SELECT 2;".into();
+        let err = state
+            .save_as(scratch_id, path.clone())
+            .expect_err("conflict expected");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // El primer buffer no se ha tocado.
+        let on_disk = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(on_disk, "SELECT 1;");
+        // Y el file_id sigue limpio.
+        assert!(!state.buffer_by_id(file_id).unwrap().dirty);
+        let _ = std::fs::remove_file(&path);
     }
 }
