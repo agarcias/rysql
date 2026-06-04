@@ -20,6 +20,66 @@ pub enum SubTab {
     Source,
 }
 
+/// Comparison operator offered in the Data filter builder. Mapped to SQL by
+/// [`build_where_clause`]; `IsNull`/`IsNotNull` take no value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Contains,
+    StartsWith,
+    IsNull,
+    IsNotNull,
+}
+
+impl FilterOp {
+    const ALL: [FilterOp; 10] = [
+        FilterOp::Eq,
+        FilterOp::Ne,
+        FilterOp::Lt,
+        FilterOp::Le,
+        FilterOp::Gt,
+        FilterOp::Ge,
+        FilterOp::Contains,
+        FilterOp::StartsWith,
+        FilterOp::IsNull,
+        FilterOp::IsNotNull,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "≠",
+            FilterOp::Lt => "<",
+            FilterOp::Le => "≤",
+            FilterOp::Gt => ">",
+            FilterOp::Ge => "≥",
+            FilterOp::Contains => "contains",
+            FilterOp::StartsWith => "starts with",
+            FilterOp::IsNull => "is null",
+            FilterOp::IsNotNull => "is not null",
+        }
+    }
+
+    /// `false` for the unary `IS [NOT] NULL` operators, which ignore the
+    /// value input.
+    fn needs_value(self) -> bool {
+        !matches!(self, FilterOp::IsNull | FilterOp::IsNotNull)
+    }
+}
+
+/// One AND-combined condition in the Data filter builder.
+#[derive(Debug, Clone)]
+pub struct FilterCond {
+    pub column: String,
+    pub op: FilterOp,
+    pub value: String,
+}
+
 pub struct ObjectViewState {
     pub kind: ObjectKind,
     pub db: String,
@@ -32,6 +92,13 @@ pub struct ObjectViewState {
     /// Backed by an entry in [`ResultsState::tabs`] keyed by the inner
     /// `tab_id`. `NotLoaded` until the user enters the Data subtab.
     pub data: LoadState<u64>,
+    /// Editable conditions in the Data filter builder. Persist across data
+    /// reloads (they live here, not on the result tab).
+    pub data_filters: Vec<FilterCond>,
+    /// The WHERE body currently in effect (without the `WHERE` keyword), or
+    /// `None` when unfiltered. Threaded into every `load_object_data` so the
+    /// filter survives pagination, refreshes and tab eviction.
+    pub applied_where: Option<String>,
     /// `true` while the user is editing the Source body. The Source
     /// `TextEdit` is interactive only in this mode; `source_buffer` is the
     /// working copy and `source_original` is the snapshot used by Revert
@@ -53,6 +120,8 @@ impl ObjectViewState {
             foreign_keys: LoadState::NotLoaded,
             source: LoadState::NotLoaded,
             data: LoadState::NotLoaded,
+            data_filters: Vec::new(),
+            applied_where: None,
             source_editing: false,
             source_buffer: String::new(),
             source_original: String::new(),
@@ -109,6 +178,11 @@ pub enum ObjectAction {
     ModifyColumn {
         name: String,
     },
+    /// User clicked Apply in the Data filter builder. The app rebuilds the
+    /// WHERE from `state.data_filters` and reloads the Data subtab.
+    ApplyDataFilter,
+    /// User clicked Clear; drop all conditions and reload unfiltered.
+    ClearDataFilter,
 }
 
 pub fn supports_structure(kind: ObjectKind) -> bool {
@@ -483,6 +557,15 @@ fn render_data(
     actions: &mut Vec<ObjectAction>,
     results_actions: &mut Vec<ResultsAction>,
 ) {
+    // The filter builder needs column metadata for its column dropdown and
+    // type-aware quoting. Lazy-load it on first entry (shared with the
+    // Structure subtab's cache, so this is a no-op if already loaded).
+    if matches!(state.columns, LoadState::NotLoaded) {
+        state.columns = LoadState::Loading;
+        actions.push(ObjectAction::LoadColumns);
+    }
+    render_data_filter_bar(ui, state, actions);
+
     match &state.data {
         LoadState::NotLoaded => {
             state.data = LoadState::Loading;
@@ -519,6 +602,214 @@ fn render_data(
             }
         }
     }
+}
+
+/// Column-filter builder pinned above the Data grid. Conditions are AND'd
+/// and applied server-side (see [`build_where_clause`]); the actual reload
+/// is driven by the [`ObjectAction::ApplyDataFilter`] / `ClearDataFilter`
+/// intents this emits.
+fn render_data_filter_bar(
+    ui: &mut egui::Ui,
+    state: &mut ObjectViewState,
+    actions: &mut Vec<ObjectAction>,
+) {
+    let panel_id = egui::Id::new(("data-filter-bar", state.db.clone(), state.name.clone()));
+    // Owned snapshot of the column list so the mutable closure below doesn't
+    // also borrow `state.columns`.
+    let columns: Vec<ColumnInfo> = match &state.columns {
+        LoadState::Loaded(c) => c.clone(),
+        _ => Vec::new(),
+    };
+    let columns_ready = !columns.is_empty();
+    let is_filtered = state.applied_where.is_some();
+
+    egui::Panel::top(panel_id)
+        .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8, 4)))
+        .show_inside(ui, |ui| {
+            let mut apply = false;
+            let mut clear = false;
+            let mut remove: Option<usize> = None;
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Filters").strong());
+                let add = egui::Button::new("+ Add condition");
+                if ui
+                    .add_enabled(columns_ready, add)
+                    .on_hover_text(if columns_ready {
+                        "Add a column condition"
+                    } else {
+                        "Loading columns…"
+                    })
+                    .clicked()
+                {
+                    let first = columns.first().map(|c| c.name.clone()).unwrap_or_default();
+                    state.data_filters.push(FilterCond {
+                        column: first,
+                        op: FilterOp::Eq,
+                        value: String::new(),
+                    });
+                }
+                if !state.data_filters.is_empty() {
+                    ui.separator();
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Clear").clicked() {
+                        clear = true;
+                    }
+                }
+                if is_filtered {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("● filtered")
+                            .color(egui::Color32::from_rgb(0x81, 0xc7, 0x84))
+                            .small(),
+                    );
+                }
+            });
+
+            for (i, cond) in state.data_filters.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    let col_label = if cond.column.is_empty() {
+                        "(column)".to_string()
+                    } else {
+                        cond.column.clone()
+                    };
+                    egui::ComboBox::from_id_salt(("filter-col", i))
+                        .selected_text(col_label)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for c in &columns {
+                                ui.selectable_value(&mut cond.column, c.name.clone(), &c.name);
+                            }
+                        });
+                    egui::ComboBox::from_id_salt(("filter-op", i))
+                        .selected_text(cond.op.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for op in FilterOp::ALL {
+                                ui.selectable_value(&mut cond.op, op, op.label());
+                            }
+                        });
+                    if cond.op.needs_value() {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut cond.value)
+                                .desired_width(220.0)
+                                .hint_text("value")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            apply = true;
+                        }
+                    } else {
+                        let mut placeholder = String::new();
+                        ui.add_enabled(
+                            false,
+                            egui::TextEdit::singleline(&mut placeholder).desired_width(220.0),
+                        );
+                    }
+                    if ui
+                        .button("✕")
+                        .on_hover_text("Remove this condition")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                });
+            }
+
+            if let Some(i) = remove {
+                state.data_filters.remove(i);
+            }
+            if apply {
+                actions.push(ObjectAction::ApplyDataFilter);
+            }
+            if clear {
+                actions.push(ObjectAction::ClearDataFilter);
+            }
+        });
+}
+
+/// Build the WHERE body (no `WHERE` keyword) for the active conditions,
+/// AND-combined. Returns `None` when nothing is active (no column picked, or
+/// an empty value on a value-requiring operator) so the caller loads
+/// unfiltered. Values are escaped; numeric columns with numeric input are
+/// emitted unquoted, everything else single-quoted.
+pub fn build_where_clause(filters: &[FilterCond], columns: &[ColumnInfo]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for f in filters {
+        if f.column.is_empty() {
+            continue;
+        }
+        let value = f.value.trim();
+        if f.op.needs_value() && value.is_empty() {
+            continue;
+        }
+        let col = format!("`{}`", f.column.replace('`', "``"));
+        let numeric = columns
+            .iter()
+            .find(|c| c.name == f.column)
+            .is_some_and(|c| is_numeric_type(&c.data_type));
+        let part = match f.op {
+            FilterOp::Eq => format!("{col} = {}", sql_scalar(value, numeric)),
+            FilterOp::Ne => format!("{col} <> {}", sql_scalar(value, numeric)),
+            FilterOp::Lt => format!("{col} < {}", sql_scalar(value, numeric)),
+            FilterOp::Le => format!("{col} <= {}", sql_scalar(value, numeric)),
+            FilterOp::Gt => format!("{col} > {}", sql_scalar(value, numeric)),
+            FilterOp::Ge => format!("{col} >= {}", sql_scalar(value, numeric)),
+            FilterOp::Contains => format!("{col} LIKE {}", like_literal(value, true, true)),
+            FilterOp::StartsWith => format!("{col} LIKE {}", like_literal(value, false, true)),
+            FilterOp::IsNull => format!("{col} IS NULL"),
+            FilterOp::IsNotNull => format!("{col} IS NOT NULL"),
+        };
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
+}
+
+fn is_numeric_type(data_type: &str) -> bool {
+    let lower = data_type.trim().to_ascii_lowercase();
+    [
+        "tinyint", "smallint", "mediumint", "bigint", "int", "integer", "decimal", "numeric",
+        "float", "double", "real", "bit", "year",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+}
+
+/// Quote a scalar for a comparison operator: numeric columns fed numeric
+/// input pass through bare; otherwise single-quote and escape.
+fn sql_scalar(value: &str, numeric: bool) -> String {
+    if numeric && value.parse::<f64>().is_ok() {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    }
+}
+
+/// Build a single-quoted LIKE pattern with the user's text matched
+/// literally (`%`/`_` in the input are escaped) and `%` wildcards added on
+/// the requested sides.
+fn like_literal(value: &str, lead: bool, trail: bool) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut out = String::from("'");
+    if lead {
+        out.push('%');
+    }
+    out.push_str(&escaped);
+    if trail {
+        out.push('%');
+    }
+    out.push('\'');
+    out
 }
 
 fn render_source(
@@ -622,5 +913,129 @@ fn render_source(
                     }
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            extra: String::new(),
+            comment: String::new(),
+        }
+    }
+
+    fn cond(column: &str, op: FilterOp, value: &str) -> FilterCond {
+        FilterCond {
+            column: column.to_string(),
+            op,
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_filters_yield_no_clause() {
+        assert_eq!(build_where_clause(&[], &[]), None);
+    }
+
+    #[test]
+    fn blank_value_is_skipped() {
+        let cols = [col("name", "varchar(255)")];
+        let f = [cond("name", FilterOp::Eq, "   ")];
+        assert_eq!(build_where_clause(&f, &cols), None);
+    }
+
+    #[test]
+    fn numeric_column_emits_bare_literal() {
+        let cols = [col("age", "int")];
+        let f = [cond("age", FilterOp::Gt, "30")];
+        assert_eq!(build_where_clause(&f, &cols).as_deref(), Some("`age` > 30"));
+    }
+
+    #[test]
+    fn numeric_column_non_numeric_input_is_quoted() {
+        let cols = [col("age", "int")];
+        let f = [cond("age", FilterOp::Eq, "n/a")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`age` = 'n/a'")
+        );
+    }
+
+    #[test]
+    fn text_column_is_quoted_and_escaped() {
+        let cols = [col("name", "varchar(255)")];
+        let f = [cond("name", FilterOp::Eq, "O'Brien")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`name` = 'O''Brien'")
+        );
+    }
+
+    #[test]
+    fn contains_wraps_and_escapes_wildcards() {
+        let cols = [col("name", "varchar(255)")];
+        let f = [cond("name", FilterOp::Contains, "50%_off")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some(r"`name` LIKE '%50\%\_off%'")
+        );
+    }
+
+    #[test]
+    fn starts_with_only_trails() {
+        let cols = [col("name", "varchar(255)")];
+        let f = [cond("name", FilterOp::StartsWith, "Ana")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`name` LIKE 'Ana%'")
+        );
+    }
+
+    #[test]
+    fn null_ops_ignore_value_and_need_no_input() {
+        let cols = [col("deleted_at", "datetime")];
+        let f = [cond("deleted_at", FilterOp::IsNull, "ignored")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`deleted_at` IS NULL")
+        );
+    }
+
+    #[test]
+    fn multiple_conditions_are_anded() {
+        let cols = [col("status", "varchar(20)"), col("age", "int")];
+        let f = [
+            cond("status", FilterOp::Eq, "active"),
+            cond("age", FilterOp::Ge, "18"),
+        ];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`status` = 'active' AND `age` >= 18")
+        );
+    }
+
+    #[test]
+    fn backtick_in_column_is_escaped() {
+        let cols = [col("we`ird", "int")];
+        let f = [cond("we`ird", FilterOp::Eq, "1")];
+        assert_eq!(
+            build_where_clause(&f, &cols).as_deref(),
+            Some("`we``ird` = 1")
+        );
+    }
+
+    #[test]
+    fn unselected_column_is_skipped() {
+        let cols = [col("age", "int")];
+        let f = [cond("", FilterOp::Eq, "5")];
+        assert_eq!(build_where_clause(&f, &cols), None);
     }
 }

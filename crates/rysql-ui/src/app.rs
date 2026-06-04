@@ -1484,6 +1484,7 @@ impl RysqlApp {
                     | ObjectAction::AddColumn
                     | ObjectAction::DropColumn { .. }
                     | ObjectAction::ModifyColumn { .. } => self.last_error = Some(msg),
+                    ObjectAction::ApplyDataFilter | ObjectAction::ClearDataFilter => {}
                 }
             }
             return;
@@ -1558,7 +1559,48 @@ impl RysqlApp {
             }
             ObjectAction::DropColumn { name } => self.enqueue_drop_column(key, name),
             ObjectAction::ModifyColumn { name } => self.open_modify_column(key, name),
+            ObjectAction::ApplyDataFilter => self.apply_data_filter(key),
+            ObjectAction::ClearDataFilter => self.clear_data_filter(key),
         }
+    }
+
+    /// Rebuild the WHERE from the Data filter builder, store it as the active
+    /// filter, and reload the Data subtab. An empty/invalid builder clears
+    /// the filter (loads everything).
+    fn apply_data_filter(&mut self, key: ObjectKey) {
+        let where_sql = self.objects.get(&key).and_then(|s| {
+            let cols: &[rysql_db::ColumnInfo] = match &s.columns {
+                LoadState::Loaded(c) => c,
+                _ => &[],
+            };
+            object_view::build_where_clause(&s.data_filters, cols)
+        });
+        if let Some(state) = self.objects.get_mut(&key) {
+            state.applied_where = where_sql;
+        }
+        self.reload_object_data(key);
+    }
+
+    /// Drop every condition and reload the Data subtab unfiltered.
+    fn clear_data_filter(&mut self, key: ObjectKey) {
+        if let Some(state) = self.objects.get_mut(&key) {
+            state.data_filters.clear();
+            state.applied_where = None;
+        }
+        self.reload_object_data(key);
+    }
+
+    /// Discard the embedded Data result (so it doesn't leak or count against
+    /// the result-tab cap) and re-fetch from scratch. `load_object_data`
+    /// re-applies `state.applied_where`, so the active filter is preserved.
+    fn reload_object_data(&mut self, key: ObjectKey) {
+        if let Some(old) = self.objects.get(&key).and_then(|s| s.data_tab_id()) {
+            self.results.remove_by_id(old);
+        }
+        if let Some(state) = self.objects.get_mut(&key) {
+            state.data = LoadState::Loading;
+        }
+        self.load_object_data(key);
     }
 
     /// Look up `name` in the Object view's cached columns and open the
@@ -1658,6 +1700,9 @@ impl RysqlApp {
     /// into the Object view's Data subtab (NOT a new dock Results tab —
     /// the grid lives inside the Object tab to avoid duplication).
     fn load_object_data(&mut self, key: ObjectKey) {
+        // Re-apply the active column filter (if any) so pagination, refreshes
+        // and tab eviction all keep filtering.
+        let where_sql = self.objects.get(&key).and_then(|s| s.applied_where.clone());
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -1667,8 +1712,12 @@ impl RysqlApp {
         let name = key.name.clone();
         let page_size = results::DEFAULT_PAGE_SIZE;
         let qualified = format!("`{}`.`{}`", db.replace('`', "``"), name.replace('`', "``"));
-        let user_sql = format!("SELECT * FROM {qualified}");
-        let exec_sql = format!("SELECT * FROM {qualified} LIMIT {page_size}");
+        let base_sql = match &where_sql {
+            Some(w) => format!("SELECT * FROM {qualified} WHERE {w}"),
+            None => format!("SELECT * FROM {qualified}"),
+        };
+        let user_sql = base_sql.clone();
+        let exec_sql = format!("{base_sql} LIMIT {page_size}");
         let event_key = key.clone();
         self.bridge.spawn(async move {
             let result = handle.query(exec_sql).await.map_err(|e| e.friendly());
