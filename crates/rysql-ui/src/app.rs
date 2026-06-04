@@ -408,7 +408,22 @@ impl RysqlApp {
                             let mut tab = ResultTab::new(tab_id, label, sql, qr);
                             tab.page_size = page_size;
                             tab.has_more = row_count >= page_size && page_size > 0;
-                            if let Some(target) = tab.detect_single_table() {
+                            // Prefer the authoritative single-table origin from
+                            // the result columns. An empty table returns zero
+                            // columns, so that detection fails — fall back to the
+                            // table identity we already know from `key` so the
+                            // Data subtab's "+ Add row" stays available even with
+                            // no rows. (Views keep origin-based detection only.)
+                            let target = tab.detect_single_table().or_else(|| {
+                                matches!(key.kind, ObjectKind::Table).then(|| {
+                                    results::EditableTarget {
+                                        db: key.db.clone(),
+                                        table: key.name.clone(),
+                                        pk_cols: Vec::new(),
+                                    }
+                                })
+                            });
+                            if let Some(target) = target {
                                 self.fetch_primary_key(
                                     tab_id,
                                     target.db.clone(),
