@@ -28,7 +28,9 @@ egui_dock = "0.19"
 egui_extras = { version = "0.34", features = ["all_loaders"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
-sqlx = { version = "0.9", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring", "chrono", "json", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring", "chrono", "bigdecimal", "json", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+bigdecimal = "0.4"
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time"] }
 
 serde = { version = "1", features = ["derive"] }
