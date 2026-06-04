@@ -46,123 +46,159 @@ pub fn render(ui: &mut egui::Ui, input: SidebarInput<'_>) -> Vec<SidebarAction> 
         filter,
     } = input;
     egui::ScrollArea::vertical().show(ui, |ui| {
-        let conn_input = ConnectionsInput {
-            profiles,
-            active,
-            in_flight,
-        };
-        connections_section(ui, &conn_input, &mut actions);
-        ui.add_space(8.0);
-        if let Some(active) = active {
-            ui.separator();
-            schema_section(ui, active, filter, &mut actions);
+        ui.horizontal(|ui| {
+            ui.heading("Connections");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+").on_hover_text("New connection").clicked() {
+                    actions.push(SidebarAction::NewConnection);
+                }
+            });
+        });
+        ui.separator();
+
+        if profiles.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label("No connections yet.");
+                if ui.button("New connection…").clicked() {
+                    actions.push(SidebarAction::NewConnection);
+                }
+            });
+            return;
+        }
+
+        // One node per connection. The active one expands into its schema
+        // tree (databases → categories → objects); inactive ones are plain
+        // rows — they have no loaded objects to nest until connected.
+        let active_name = active.map(|a| a.profile_name.as_str());
+        for profile in profiles {
+            let is_active = active_name == Some(profile.name.as_str());
+            let is_busy = in_flight.contains(&profile.name);
+            if is_active {
+                if let Some(active) = active {
+                    connection_node(ui, profile, active, is_busy, filter, &mut actions);
+                }
+            } else {
+                inactive_connection_row(ui, profile, is_busy, &mut actions);
+            }
+            ui.add_space(2.0);
         }
     });
     actions
 }
 
-/// Subset of [`SidebarInput`] needed by `connections_section`; pulled
-/// out so the function signature stays the same as before the filter
-/// addition.
-struct ConnectionsInput<'a> {
-    profiles: &'a [ConnectionProfile],
-    active: Option<&'a ActiveConnection>,
-    in_flight: &'a std::collections::HashSet<String>,
+/// `user@host:port[/db]` endpoint line shown under a connection.
+fn endpoint_label(profile: &ConnectionProfile) -> String {
+    format!(
+        "{}@{}:{}{}",
+        profile.user,
+        profile.host,
+        profile.port,
+        profile
+            .database
+            .as_deref()
+            .map(|d| format!("/{d}"))
+            .unwrap_or_default()
+    )
 }
 
-fn connections_section(
+/// A connected profile: a collapsing node (open by default) whose body holds
+/// the endpoint/version subtitle and the full schema tree.
+fn connection_node(
     ui: &mut egui::Ui,
-    input: &ConnectionsInput<'_>,
+    profile: &ConnectionProfile,
+    active: &ActiveConnection,
+    is_busy: bool,
+    filter: &mut String,
+    actions: &mut Vec<SidebarAction>,
+) {
+    let resp = egui::CollapsingHeader::new(
+        egui::RichText::new(format!("● {}", profile.name)).strong(),
+    )
+    .id_salt(("conn", &profile.name))
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(endpoint_label(profile))
+                .weak()
+                .small(),
+        );
+        schema_body(ui, active, filter, actions);
+    });
+
+    if is_busy {
+        ui.spinner();
+    }
+
+    resp.header_response.context_menu(|ui| {
+        if ui.button("Disconnect").clicked() {
+            actions.push(SidebarAction::Disconnect);
+            ui.close();
+        }
+        if ui.button("Refresh databases").clicked() {
+            actions.push(SidebarAction::RefreshDatabases);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            actions.push(SidebarAction::DeleteProfile(profile.name.clone()));
+            ui.close();
+        }
+    });
+}
+
+/// A profile that isn't the active connection: a simple row. Double-click or
+/// the context menu connects; there's nothing to expand yet.
+fn inactive_connection_row(
+    ui: &mut egui::Ui,
+    profile: &ConnectionProfile,
+    is_busy: bool,
     actions: &mut Vec<SidebarAction>,
 ) {
     ui.horizontal(|ui| {
-        ui.heading("Connections");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("+").on_hover_text("New connection").clicked() {
-                actions.push(SidebarAction::NewConnection);
-            }
-        });
-    });
-    ui.separator();
-
-    if input.profiles.is_empty() {
-        ui.add_space(8.0);
-        ui.vertical_centered(|ui| {
-            ui.label("No connections yet.");
-            if ui.button("New connection…").clicked() {
-                actions.push(SidebarAction::NewConnection);
-            }
-        });
-        return;
-    }
-
-    let active_name = input.active.map(|a| a.profile_name.as_str());
-
-    for profile in input.profiles {
-        let is_active = active_name == Some(profile.name.as_str());
-        let is_busy = input.in_flight.contains(&profile.name);
-
-        let label = if is_active {
-            format!("● {}", profile.name)
-        } else {
-            format!("○ {}", profile.name)
-        };
-
-        ui.horizontal(|ui| {
-            let resp = ui.selectable_label(is_active, label);
-            if resp.double_clicked() && !is_active && !is_busy {
+        let resp = ui.selectable_label(false, format!("○ {}", profile.name));
+        if resp.double_clicked() && !is_busy {
+            actions.push(SidebarAction::Connect(profile.name.clone()));
+        }
+        resp.context_menu(|ui| {
+            if ui
+                .add_enabled(!is_busy, egui::Button::new("Connect"))
+                .clicked()
+            {
                 actions.push(SidebarAction::Connect(profile.name.clone()));
+                ui.close();
             }
-            resp.context_menu(|ui| {
-                if !is_active
-                    && ui
-                        .add_enabled(!is_busy, egui::Button::new("Connect"))
-                        .clicked()
-                {
-                    actions.push(SidebarAction::Connect(profile.name.clone()));
-                    ui.close();
-                }
-                if is_active && ui.button("Disconnect").clicked() {
-                    actions.push(SidebarAction::Disconnect);
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Delete").clicked() {
-                    actions.push(SidebarAction::DeleteProfile(profile.name.clone()));
-                    ui.close();
-                }
-            });
-            if is_busy {
-                ui.spinner();
+            ui.separator();
+            if ui.button("Delete").clicked() {
+                actions.push(SidebarAction::DeleteProfile(profile.name.clone()));
+                ui.close();
             }
         });
-        ui.label(
-            egui::RichText::new(format!(
-                "{}@{}:{}{}",
-                profile.user,
-                profile.host,
-                profile.port,
-                profile
-                    .database
-                    .as_deref()
-                    .map(|d| format!("/{d}"))
-                    .unwrap_or_default()
-            ))
+        if is_busy {
+            ui.spinner();
+        }
+    });
+    ui.label(
+        egui::RichText::new(endpoint_label(profile))
             .weak()
             .small(),
-        );
-        ui.add_space(4.0);
-    }
+    );
 }
 
-fn schema_section(
+/// Schema tree body, rendered inside the active connection's node: a
+/// version/refresh row, the name filter, and the databases tree.
+fn schema_body(
     ui: &mut egui::Ui,
     active: &ActiveConnection,
     filter: &mut String,
     actions: &mut Vec<SidebarAction>,
 ) {
     ui.horizontal(|ui| {
-        ui.heading("Schema");
+        ui.label(
+            egui::RichText::new(format!("Schema · {}", active.info.version))
+                .weak()
+                .small(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button("↻")
@@ -173,11 +209,6 @@ fn schema_section(
             }
         });
     });
-    ui.label(
-        egui::RichText::new(format!("{} · {}", active.profile_name, active.info.version))
-            .weak()
-            .small(),
-    );
 
     // Filter input — substring match against DB names and object names.
     // Empty → existing render path; non-empty → flat filtered view.
