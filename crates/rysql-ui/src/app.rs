@@ -16,6 +16,7 @@ use crate::column_dialog::{self, ColumnEditChoice, ColumnEditMode, ColumnEditSta
 use crate::dialog::{self, ConfirmChoice, DialogAction, NewConnectionDialog, TestOutcome};
 use crate::dock::{AppViewer, DockAction, DockTab};
 use crate::editor::{self, EditorAction, EditorState};
+use crate::export_dialog::{self, ExportChoice, ExportState, OutputFormat};
 use crate::history_view::{self, HistoryAction, HistoryView};
 use crate::object_view::{self, ObjectAction, ObjectViewState};
 #[allow(unused_imports)]
@@ -54,6 +55,8 @@ pub struct RysqlApp {
     source_highlighter: Highlighter,
     /// Open instance of the column add/modify modal (one at a time).
     column_edit_modal: Option<ColumnEditState>,
+    /// Open instance of the database export modal (one at a time).
+    export_modal: Option<ExportState>,
     /// Substring filter applied to the schema sidebar. UI-side only —
     /// persists across reconnects (lives on the app, not on
     /// `ActiveConnection`).
@@ -123,6 +126,7 @@ impl RysqlApp {
             objects: HashMap::new(),
             source_highlighter: Highlighter::new_dark(),
             column_edit_modal: None,
+            export_modal: None,
             schema_filter: String::new(),
             pending_editor_focus: false,
             settings,
@@ -326,6 +330,20 @@ impl RysqlApp {
                         }
                     }
                 }
+                UiEvent::ExportProgress { done, total, label } => {
+                    self.last_error = None;
+                    self.last_info = Some(format!("Exporting… ({done}/{total}) {label}"));
+                }
+                UiEvent::ExportFinished { result } => match result {
+                    Ok(dest) => {
+                        self.last_error = None;
+                        self.last_info = Some(format!("Exported to {dest}"));
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Export failed: {e}"));
+                        self.last_info = None;
+                    }
+                },
                 UiEvent::StreamFinished => {
                     self.in_flight_query = None;
                 }
@@ -730,7 +748,10 @@ impl RysqlApp {
         let page_size = results::DEFAULT_PAGE_SIZE;
 
         // Replace any previous in-flight stream so its abort handle is dropped.
+        // Clear any stale status so the running indicator reads "Running…"
+        // (not a leftover progress/info line from a prior operation).
         self.in_flight_query = None;
+        self.last_info = None;
         let abort = self.bridge.spawn_stream(move |emitter| async move {
             for stmt in statements {
                 let label = sql_label(&stmt);
@@ -2071,6 +2092,9 @@ impl RysqlApp {
                 SidebarAction::OpenObject { db, kind, name } => {
                     self.focus_or_open_object(ObjectKey::new(kind, db, name));
                 }
+                SidebarAction::ExportDatabase(db) => {
+                    self.export_modal = Some(ExportState::new(db));
+                }
                 SidebarAction::Confirm(action) => {
                     self.confirm = Some(action);
                     self.confirm_typed.clear();
@@ -2197,9 +2221,11 @@ impl RysqlApp {
             if self.in_flight_query.is_some() {
                 ui.separator();
                 ui.spinner();
+                // Surface live progress (e.g. the export's "Exporting… (n/total)")
+                // when set; fall back to a generic label for plain queries.
+                let label = self.last_info.as_deref().unwrap_or("Running…");
                 ui.label(
-                    egui::RichText::new("Running…")
-                        .color(egui::Color32::from_rgb(0x8a, 0xb4, 0xf8)),
+                    egui::RichText::new(label).color(egui::Color32::from_rgb(0x8a, 0xb4, 0xf8)),
                 );
                 if ui.small_button("Cancel").clicked() {
                     cancel = true;
@@ -2346,6 +2372,47 @@ fn pick_save_path(suggested: Option<&Path>, fallback_dir: Option<&Path>) -> Opti
     d.save_file()
 }
 
+/// Blocking native picker for a database-export `.sql` destination. Seeds the
+/// filename with `<db>.sql`. See [`pick_open_path`] for the Tokio context note.
+fn pick_export_sql_path(db: &str, fallback_dir: Option<&Path>) -> Option<PathBuf> {
+    let _guard = crate::runtime::handle().enter();
+    let mut d = rfd::FileDialog::new().add_filter("SQL", &["sql"]);
+    if let Some(dir) = fallback_dir {
+        d = d.set_directory(dir);
+    }
+    d = d.set_file_name(format!("{}.sql", sanitize_export_name(db)));
+    d.save_file()
+}
+
+/// Blocking native picker for a destination folder (CSV-per-table export).
+/// See [`pick_open_path`] for the Tokio context note.
+fn pick_folder(initial_dir: Option<&Path>) -> Option<PathBuf> {
+    let _guard = crate::runtime::handle().enter();
+    let mut d = rfd::FileDialog::new();
+    if let Some(dir) = initial_dir {
+        d = d.set_directory(dir);
+    }
+    d.pick_folder()
+}
+
+/// Make a database name safe to use as a suggested file stem.
+fn sanitize_export_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "database".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 impl eframe::App for RysqlApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2435,6 +2502,7 @@ impl eframe::App for RysqlApp {
         self.render_insert_modal(&ctx);
         self.render_bulk_update_modal(&ctx);
         self.render_column_edit_modal(&ctx);
+        self.render_export_modal(&ctx);
         self.render_history(&ctx);
 
         // Last so it takes effect on the *next* frame's editor render.
@@ -2675,4 +2743,101 @@ impl RysqlApp {
             }
         }
     }
+
+    fn render_export_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.export_modal.take() else {
+            return;
+        };
+        match export_dialog::render_export_modal(ctx, &mut state) {
+            ExportChoice::None => {
+                self.export_modal = Some(state);
+            }
+            ExportChoice::Cancel => {
+                // dropped
+            }
+            ExportChoice::Run => self.start_export(state),
+        }
+    }
+
+    /// Pick a destination and kick off the export on the background runtime.
+    /// Progress and completion arrive as `ExportProgress` / `ExportFinished`
+    /// events; the in-flight handle reuses the status-bar Cancel button.
+    fn start_export(&mut self, state: ExportState) {
+        // Capture the connection up front so the immutable borrow of `self`
+        // ends before `remember_browse_dir` needs `&mut self`.
+        let handle = match self.active.as_ref() {
+            Some(active) => active.handle.clone(),
+            None => {
+                self.last_error = Some("Not connected".into());
+                return;
+            }
+        };
+
+        let fallback = self.settings.last_browse_dir.clone();
+        let dest = match state.format {
+            OutputFormat::Sql => {
+                let Some(path) = pick_export_sql_path(&state.db, fallback.as_deref()) else {
+                    self.export_modal = Some(state);
+                    return;
+                };
+                self.remember_browse_dir(path.parent());
+                ExportDest::Sql(path)
+            }
+            OutputFormat::Csv => {
+                let Some(dir) = pick_folder(fallback.as_deref()) else {
+                    self.export_modal = Some(state);
+                    return;
+                };
+                self.remember_browse_dir(Some(&dir));
+                ExportDest::Csv(dir)
+            }
+        };
+
+        let db = state.db.clone();
+        let opts = state.opts.clone();
+
+        // Replace any previous in-flight stream so its abort handle is dropped.
+        self.in_flight_query = None;
+        let abort = self.bridge.spawn_stream(move |emitter| async move {
+            let prog = emitter.clone();
+            let send_progress = move |p: rysql_db::ExportProgress| {
+                prog.send(UiEvent::ExportProgress {
+                    done: p.done,
+                    total: p.total,
+                    label: p.label,
+                });
+            };
+
+            let result: Result<String, String> = match dest {
+                ExportDest::Sql(path) => {
+                    match rysql_db::export::dump_database(&handle, &db, &opts, send_progress).await
+                    {
+                        Ok(sql) => std::fs::write(&path, sql)
+                            .map(|_| path.display().to_string())
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.friendly()),
+                    }
+                }
+                ExportDest::Csv(dir) => {
+                    match rysql_db::export::export_csv(&handle, &db, &dir, send_progress).await {
+                        Ok(paths) => Ok(format!("{} file(s) in {}", paths.len(), dir.display())),
+                        Err(e) => Err(e.friendly()),
+                    }
+                }
+            };
+
+            emitter.send(UiEvent::ExportFinished { result });
+        });
+        self.in_flight_query = Some(abort);
+        self.last_error = None;
+        self.last_info = Some("Exporting…".into());
+    }
+}
+
+/// Where a database export should land, resolved from the dialog's format.
+enum ExportDest {
+    /// A single `.sql` dump file.
+    Sql(PathBuf),
+    /// A folder receiving one `<table>.csv` per table.
+    Csv(PathBuf),
 }

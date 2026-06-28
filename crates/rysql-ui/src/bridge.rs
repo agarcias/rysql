@@ -78,6 +78,18 @@ pub enum UiEvent {
     /// because the stream emitted everything it had). The app uses this to
     /// hide the running indicator and clear its abort handle.
     StreamFinished,
+    /// A database export advanced one object. Drives the status-bar progress
+    /// line; `done`/`total` count objects (SQL dump) or tables (CSV).
+    ExportProgress {
+        done: usize,
+        total: usize,
+        label: String,
+    },
+    /// A database export finished. `Ok` carries a human-readable destination
+    /// summary (file path or folder + file count); `Err` a friendly message.
+    ExportFinished {
+        result: Result<String, String>,
+    },
     ObjectColumnsLoaded {
         profile: String,
         key: ObjectKey,

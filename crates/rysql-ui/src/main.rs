@@ -6,6 +6,7 @@ mod column_dialog;
 mod dialog;
 mod dock;
 mod editor;
+mod export_dialog;
 mod fonts;
 mod history_view;
 mod logging;

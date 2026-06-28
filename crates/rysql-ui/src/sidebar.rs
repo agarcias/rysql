@@ -25,6 +25,8 @@ pub enum SidebarAction {
         kind: ObjectKind,
         name: String,
     },
+    /// Open the export dialog for the named database.
+    ExportDatabase(String),
     Confirm(ConfirmAction),
 }
 
@@ -112,19 +114,14 @@ fn connection_node(
     filter: &mut String,
     actions: &mut Vec<SidebarAction>,
 ) {
-    let resp = egui::CollapsingHeader::new(
-        egui::RichText::new(format!("● {}", profile.name)).strong(),
-    )
-    .id_salt(("conn", &profile.name))
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.label(
-            egui::RichText::new(endpoint_label(profile))
-                .weak()
-                .small(),
-        );
-        schema_body(ui, active, filter, actions);
-    });
+    let resp =
+        egui::CollapsingHeader::new(egui::RichText::new(format!("● {}", profile.name)).strong())
+            .id_salt(("conn", &profile.name))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(endpoint_label(profile)).weak().small());
+                schema_body(ui, active, filter, actions);
+            });
 
     if is_busy {
         ui.spinner();
@@ -178,11 +175,7 @@ fn inactive_connection_row(
             ui.spinner();
         }
     });
-    ui.label(
-        egui::RichText::new(endpoint_label(profile))
-            .weak()
-            .small(),
-    );
+    ui.label(egui::RichText::new(endpoint_label(profile)).weak().small());
 }
 
 /// Schema tree body, rendered inside the active connection's node: a
@@ -525,6 +518,11 @@ fn render_db_node(
         }
         if ui.button("Copy name").clicked() {
             actions.push(SidebarAction::CopyText(db.to_string()));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Export database…").clicked() {
+            actions.push(SidebarAction::ExportDatabase(db.to_string()));
             ui.close();
         }
         ui.separator();
