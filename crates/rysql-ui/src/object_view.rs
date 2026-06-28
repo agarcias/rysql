@@ -774,8 +774,19 @@ pub fn build_where_clause(filters: &[FilterCond], columns: &[ColumnInfo]) -> Opt
 fn is_numeric_type(data_type: &str) -> bool {
     let lower = data_type.trim().to_ascii_lowercase();
     [
-        "tinyint", "smallint", "mediumint", "bigint", "int", "integer", "decimal", "numeric",
-        "float", "double", "real", "bit", "year",
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "bigint",
+        "int",
+        "integer",
+        "decimal",
+        "numeric",
+        "float",
+        "double",
+        "real",
+        "bit",
+        "year",
     ]
     .iter()
     .any(|p| lower.starts_with(p))
