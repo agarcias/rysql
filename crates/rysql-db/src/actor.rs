@@ -92,9 +92,10 @@ enum DbCommand {
     },
     /// Re-create a routine (procedure / function / view) by running an
     /// optional `DROP` followed by the user-supplied `CREATE` body. The
-    /// body is shipped as a single sqlx::query, bypassing the client-side
-    /// statement splitter — which would otherwise mis-cut `;` inside
-    /// `BEGIN ... END`.
+    /// body is shipped via the text protocol (`raw_sql`) as a single command,
+    /// bypassing the client-side statement splitter — which would otherwise
+    /// mis-cut `;` inside `BEGIN ... END` — and avoiding the prepared-statement
+    /// protocol, which rejects routine bodies with error 1295.
     ReplaceRoutine {
         drop_sql: Option<String>,
         create_sql: String,
@@ -293,7 +294,14 @@ async fn server_info(pool: &MySqlPool) -> Result<ServerInfo, ActorError> {
 
 async fn execute(pool: &MySqlPool, sql: &str) -> Result<ExecOutcome, ActorError> {
     let start = Instant::now();
-    let result = sqlx::query(AssertSqlSafe(sql.to_string()))
+    // Use the text protocol (`COM_QUERY`) rather than `sqlx::query`, which
+    // prepares the statement. MySQL rejects several statements in the
+    // prepared-statement protocol with error 1295 ("not supported in the
+    // prepared statement protocol yet") — notably `CREATE PROCEDURE`,
+    // `CREATE FUNCTION`, `CREATE TRIGGER`, `CREATE EVENT` and compound
+    // `BEGIN … END` blocks. Ad-hoc SQL carries no bind parameters, so we lose
+    // nothing by skipping prepare.
+    let result = sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
         .execute(pool)
         .await?;
     Ok(ExecOutcome {
@@ -314,10 +322,14 @@ async fn replace_routine(
     create_sql: String,
 ) -> Result<ExecOutcome, ActorError> {
     if let Some(drop) = drop_sql {
-        let _ = sqlx::query(AssertSqlSafe(drop)).execute(pool).await;
+        let _ = sqlx::raw_sql(AssertSqlSafe(drop)).execute(pool).await;
     }
     let start = Instant::now();
-    let result = sqlx::query(AssertSqlSafe(create_sql)).execute(pool).await?;
+    // `raw_sql` (text protocol): a procedure/function/trigger body cannot be
+    // shipped through the prepared-statement protocol — MySQL returns 1295.
+    let result = sqlx::raw_sql(AssertSqlSafe(create_sql))
+        .execute(pool)
+        .await?;
     Ok(ExecOutcome {
         affected_rows: result.rows_affected(),
         elapsed: start.elapsed(),
