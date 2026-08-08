@@ -24,11 +24,24 @@ fn main() -> eframe::Result<()> {
     // Pre-warm the tokio runtime so it's ready when the first frame renders.
     let _ = runtime::handle();
 
+    // `app_id` becomes the Wayland xdg-shell app_id / Hyprland window class.
+    // Must match StartupWMClass in packaging/linux/rysql.desktop so the
+    // compositor can identify the window (avoids "RySQL - (desconocido)"
+    // in ANR dialogs) and associate icons / desktop actions.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RySQL")
+            .with_app_id("RySQL")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0]),
+        // On Linux (esp. Hyprland/Wayland), vsync Wait can block the UI
+        // thread in eglSwapBuffers when the window is on an inactive
+        // workspace and the compositor stops sending frame callbacks.
+        // That freezes the event loop long enough for Hyprland's ANR
+        // dialog ("La aplicación no responde"). DontWait keeps pings
+        // answered; minor tearing is preferable to false freezes.
+        #[cfg(target_os = "linux")]
+        vsync: false,
         ..Default::default()
     };
 
